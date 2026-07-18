@@ -2,8 +2,8 @@ import asyncio
 import json
 import logging
 import random
-import aiosqlite
 import os
+import asyncpg
 from datetime import datetime, timezone, timedelta
 
 from aiogram import Bot, Dispatcher, F, types
@@ -19,15 +19,12 @@ import aiohttp
 from aiohttp import web
 
 # ---------- НАСТРОЙКИ ----------
-TOKEN = os.getenv("BOT_TOKEN")
-if not TOKEN:
-    raise ValueError("BOT_TOKEN не установлен!")
+TOKEN = "8641527466:AAGSkaTzMJm5X6ExY3vVYRiMLxkwSxOOpnU"
+DATABASE_URL = "postgresql://postgres:9hna5RRR@db.wlyohywetdxyuwcgzjhh.supabase.co:5432/postgres"
 
 MOSCOW_TZ = timezone(timedelta(hours=3))
-DB_PATH = "bot_database.db"
 
-ADMIN_USERNAMES = ["Woozinoid"]  # замените на свои юзернеймы
-
+ADMIN_USERNAMES = ["Woozinoid", "HwangMinw"]
 chat_users = set()
 
 logging.basicConfig(level=logging.INFO)
@@ -41,130 +38,154 @@ class AddCity(StatesGroup):
 class Broadcast(StatesGroup):
     waiting_for_message = State()
 
-# ---------- БАЗА ДАННЫХ ----------
+class SetNickname(StatesGroup):
+    waiting_for_nick = State()
+
+# ---------- БАЗА ДАННЫХ (PostgreSQL) ----------
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                language TEXT DEFAULT 'ru',
-                reg_date TEXT,
-                status TEXT DEFAULT 'active'
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS locations (
-                user_id INTEGER PRIMARY KEY,
-                lat REAL,
-                lon REAL
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS cities (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                name TEXT,
-                lat REAL,
-                lon REAL,
-                UNIQUE(user_id, name)
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS chat_state (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                enabled INTEGER DEFAULT 0
-            )
-        """)
-        await db.execute("INSERT OR IGNORE INTO chat_state (id, enabled) VALUES (1, 0)")
-        await db.commit()
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            username TEXT,
+            language TEXT DEFAULT 'ru',
+            reg_date TIMESTAMPTZ DEFAULT NOW(),
+            status TEXT DEFAULT 'active'
+        )
+    """)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS locations (
+            user_id BIGINT PRIMARY KEY,
+            lat REAL,
+            lon REAL
+        )
+    """)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS cities (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            name TEXT,
+            lat REAL,
+            lon REAL,
+            UNIQUE(user_id, name)
+        )
+    """)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS chat_state (
+            id INTEGER PRIMARY KEY DEFAULT 1,
+            enabled BOOLEAN DEFAULT FALSE
+        )
+    """)
+    await conn.execute("INSERT INTO chat_state (id, enabled) VALUES (1, FALSE) ON CONFLICT DO NOTHING")
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS profiles (
+            user_id BIGINT PRIMARY KEY,
+            nickname TEXT
+        )
+    """)
+    await conn.close()
 
 async def create_user(user_id: int, username: str = None):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO users (user_id, username, reg_date) VALUES (?, ?, ?)",
-            (user_id, username, datetime.now(MOSCOW_TZ).isoformat())
-        )
-        await db.commit()
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute(
+        "INSERT INTO users (user_id, username) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        user_id, username
+    )
+    await conn.close()
 
 async def get_user_language(user_id: int) -> str:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT language FROM users WHERE user_id = ?", (user_id,))
-        row = await cursor.fetchone()
-        return row[0] if row else "ru"
+    conn = await asyncpg.connect(DATABASE_URL)
+    row = await conn.fetchrow("SELECT language FROM users WHERE user_id = $1", user_id)
+    await conn.close()
+    return row['language'] if row else "ru"
 
 async def set_user_language(user_id: int, lang: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET language = ? WHERE user_id = ?", (lang, user_id))
-        await db.commit()
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute("UPDATE users SET language = $1 WHERE user_id = $2", lang, user_id)
+    await conn.close()
 
 async def get_user_status(user_id: int) -> str:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT status FROM users WHERE user_id = ?", (user_id,))
-        row = await cursor.fetchone()
-        return row[0] if row else "active"
+    conn = await asyncpg.connect(DATABASE_URL)
+    row = await conn.fetchrow("SELECT status FROM users WHERE user_id = $1", user_id)
+    await conn.close()
+    return row['status'] if row else "active"
 
 async def set_user_status(user_id: int, status: str):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET status = ? WHERE user_id = ?", (status, user_id))
-        await db.commit()
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute("UPDATE users SET status = $1 WHERE user_id = $2", status, user_id)
+    await conn.close()
 
 async def save_location(user_id: int, lat: float, lon: float):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO locations (user_id, lat, lon) VALUES (?, ?, ?)",
-            (user_id, lat, lon)
-        )
-        await db.commit()
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute(
+        "INSERT INTO locations (user_id, lat, lon) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO UPDATE SET lat=$2, lon=$3",
+        user_id, lat, lon
+    )
+    await conn.close()
 
 async def get_location(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT lat, lon FROM locations WHERE user_id = ?", (user_id,))
-        row = await cursor.fetchone()
-        return (row[0], row[1]) if row else None
+    conn = await asyncpg.connect(DATABASE_URL)
+    row = await conn.fetchrow("SELECT lat, lon FROM locations WHERE user_id = $1", user_id)
+    await conn.close()
+    return (row['lat'], row['lon']) if row else None
 
 async def add_city_db(user_id: int, name: str, lat: float, lon: float) -> bool:
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute(
-                "INSERT INTO cities (user_id, name, lat, lon) VALUES (?, ?, ?, ?)",
-                (user_id, name, lat, lon)
-            )
-            await db.commit()
+        conn = await asyncpg.connect(DATABASE_URL)
+        await conn.execute(
+            "INSERT INTO cities (user_id, name, lat, lon) VALUES ($1, $2, $3, $4)",
+            user_id, name, lat, lon
+        )
+        await conn.close()
         return True
     except:
         return False
 
 async def get_cities(user_id: int) -> list:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT name, lat, lon FROM cities WHERE user_id = ?", (user_id,))
-        rows = await cursor.fetchall()
-        return [{"name": row[0], "lat": row[1], "lon": row[2]} for row in rows]
+    conn = await asyncpg.connect(DATABASE_URL)
+    rows = await conn.fetch("SELECT name, lat, lon FROM cities WHERE user_id = $1", user_id)
+    await conn.close()
+    return [{"name": r['name'], "lat": r['lat'], "lon": r['lon']} for r in rows]
 
 async def city_exists(user_id: int, name: str) -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "SELECT 1 FROM cities WHERE user_id = ? AND LOWER(name) = LOWER(?)",
-            (user_id, name)
-        )
-        return await cursor.fetchone() is not None
+    conn = await asyncpg.connect(DATABASE_URL)
+    row = await conn.fetchrow(
+        "SELECT 1 FROM cities WHERE user_id = $1 AND LOWER(name) = LOWER($2)",
+        user_id, name
+    )
+    await conn.close()
+    return row is not None
 
 async def get_chat_state() -> bool:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT enabled FROM chat_state WHERE id = 1")
-        row = await cursor.fetchone()
-        return bool(row[0]) if row else False
+    conn = await asyncpg.connect(DATABASE_URL)
+    row = await conn.fetchrow("SELECT enabled FROM chat_state WHERE id = 1")
+    await conn.close()
+    return row['enabled'] if row else False
 
 async def set_chat_state(enabled: bool):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE chat_state SET enabled = ? WHERE id = 1", (int(enabled),))
-        await db.commit()
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute("UPDATE chat_state SET enabled = $1 WHERE id = 1", enabled)
+    await conn.close()
 
 async def get_all_user_ids() -> list:
-    async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute("SELECT user_id FROM users")
-        rows = await cursor.fetchall()
-        return [row[0] for row in rows]
+    conn = await asyncpg.connect(DATABASE_URL)
+    rows = await conn.fetch("SELECT user_id FROM users")
+    await conn.close()
+    return [r['user_id'] for r in rows]
+
+async def set_nickname(user_id: int, nick: str):
+    conn = await asyncpg.connect(DATABASE_URL)
+    await conn.execute(
+        "INSERT INTO profiles (user_id, nickname) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET nickname = $2",
+        user_id, nick
+    )
+    await conn.close()
+
+async def get_nickname(user_id: int) -> str | None:
+    conn = await asyncpg.connect(DATABASE_URL)
+    row = await conn.fetchrow("SELECT nickname FROM profiles WHERE user_id = $1", user_id)
+    await conn.close()
+    return row['nickname'] if row else None
 
 # ---------- ПОГОДНЫЕ КОДЫ ----------
 WEATHER_CODES_RU = {
@@ -199,7 +220,7 @@ RU = {
     "currency_menu": "💰 Выберите валютную пару:",
     "loading_currency": "⏳ Загружаю данные по {pair}...",
     "language_select": "🌐 Выберите язык / Виберіть мову:",
-    "banned_msg": "⛔ Вы забанены. Обратитесь к @Woozinoid.",
+    "banned_msg": "⛔ Вы забанены. Обратитесь к администратору.",
     "muted_msg": "🔇 Вы временно не можете писать.",
     "chat_enter": "💬 Вы вошли в общий чат.",
     "chat_leave": "💬 Вы вышли из чата.",
@@ -209,11 +230,16 @@ RU = {
     "whitelist_empty": "📋 Список заблокированных пуст.",
     "broadcast_sent": "✅ Сообщение отправлено {count} пользователям.",
     "admin_menu": "🔧 <b>Админ-панель</b>",
-    "main_menu": [["🌟 Погода", "💰 Курсы валют"], ["🌐 Язык", "📍 Обновить геолокацию"]],
+    "main_menu": [["🌟 Погода", "💰 Курсы валют"], ["🌐 Язык", "📍 Обновить геолокацию"], ["👤 Профиль"]],
     "weather_frame": "🌍 {city}\n🌤 {desc}\n🌡 Температура: {temp}°C (ощ. {feels}°C)\n☁️ Облачность: {cloudcover}%\n💧 Влажность: {humidity}%\n🔵 Давление: {pressure} мм рт.ст.\n🌅 Восход: {sunrise}\n🌇 Закат: {sunset}",
     "now_in_city": "🌈 Сейчас в {city}: {desc}",
     "fiat_info": "📅 <b>{date}</b> 🕒 {time} (МСК)\n\n<b>{pair}</b>\n💰 Текущий курс: <b>{current:.2f} ₽</b>\n📉 За 24 часа: {arrow_24} {change_24:+.2f} ₽ ({change_24_pct:+.2f}%)\n{week_info}",
     "ton_info": "📅 <b>{date}</b> 🕒 {time} (МСК)\n\n<b>💎 TON/RUB</b>\n💰 Текущий курс: <b>{ton_rub:.2f} ₽</b> (${ton_usd:.4f})\n📉 За 24 часа: {arrow} {change_pct:+.2f}%",
+    "profile_menu": "👤 <b>Профиль</b>\nВаш ник: {nick}\nВыберите действие:",
+    "set_nick_prompt": "✏️ Введите новый никнейм (только буквы, цифры, без пробелов):",
+    "nick_saved": "✅ Никнейм сохранён: {nick}",
+    "nick_not_set": "не задан",
+    "chat_joined": "💬 Пользователь {name} присоединился к чату."
 }
 
 UK = {
@@ -242,11 +268,16 @@ UK = {
     "whitelist_empty": "📋 Список порожній.",
     "broadcast_sent": "✅ Надіслано {count} користувачам.",
     "admin_menu": "🔧 <b>Адмін-панель</b>",
-    "main_menu": [["🌟 Погода", "💰 Курсы валют"], ["🌐 Мова", "📍 Оновити геолокацію"]],
+    "main_menu": [["🌟 Погода", "💰 Курсы валют"], ["🌐 Мова", "📍 Оновити геолокацію"], ["👤 Профіль"]],
     "weather_frame": "🌍 {city}\n🌤 {desc}\n🌡 Температура: {temp}°C (відч. {feels}°C)\n☁️ Хмарність: {cloudcover}%\n💧 Вологість: {humidity}%\n🔵 Тиск: {pressure} мм рт.ст.\n🌅 Схід: {sunrise}\n🌇 Захід: {sunset}",
     "now_in_city": "🌈 Зараз у {city}: {desc}",
     "fiat_info": "📅 <b>{date}</b> 🕒 {time} (МСК)\n\n<b>{pair}</b>\n💰 Поточний курс: <b>{current:.2f} ₽</b>\n📉 За 24 години: {arrow_24} {change_24:+.2f} ₽ ({change_24_pct:+.2f}%)\n{week_info}",
     "ton_info": "📅 <b>{date}</b> 🕒 {time} (МСК)\n\n<b>💎 TON/RUB</b>\n💰 Поточний курс: <b>{ton_rub:.2f} ₽</b> (${ton_usd:.4f})\n📉 За 24 години: {arrow} {change_pct:+.2f}%",
+    "profile_menu": "👤 <b>Профіль</b>\nВаш нік: {nick}\nОберіть дію:",
+    "set_nick_prompt": "✏️ Введіть новий нікнейм (тільки літери, цифри, без пробілів):",
+    "nick_saved": "✅ Нікнейм збережено: {nick}",
+    "nick_not_set": "не задано",
+    "chat_joined": "💬 Користувач {name} приєднався до чату."
 }
 
 MONTHS_RU = ["", "января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"]
@@ -277,6 +308,18 @@ async def check_status(message: types.Message):
         return False
     return True
 
+async def get_display_name(user_id: int) -> str:
+    nick = await get_nickname(user_id)
+    if nick:
+        return nick
+    try:
+        user = await bot.get_chat(user_id)
+        if user.username:
+            return f"@{user.username}"
+        return user.first_name or f"id{user_id}"
+    except:
+        return f"id{user_id}"
+
 # ---------- КЛАВИАТУРЫ ----------
 def get_location_kb(lang):
     return ReplyKeyboardMarkup(
@@ -289,7 +332,7 @@ async def get_main_kb(lang, user: types.User = None):
     buttons = []
     for row in t["main_menu"]:
         buttons.append([KeyboardButton(text=btn) for btn in row])
-    buttons[-1][1] = KeyboardButton(text=buttons[-1][1].text, request_location=True)
+    buttons[-2][1] = KeyboardButton(text=buttons[-2][1].text, request_location=True)
     chat_enabled = await get_chat_state()
     if chat_enabled:
         buttons.append([KeyboardButton(text="💬 Чат")])
@@ -331,6 +374,16 @@ def get_language_kb():
         resize_keyboard=True
     )
 
+def get_profile_kb(lang):
+    t = RU if lang == 'ru' else UK
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="✏️ Изменить ник" if lang=='ru' else "✏️ Змінити нік")],
+            [KeyboardButton(text="↩ Назад")]
+        ],
+        resize_keyboard=True
+    )
+
 # ---------- API ФУНКЦИИ ----------
 async def geocode_city(city_name: str) -> tuple:
     url = "https://nominatim.openstreetmap.org/search"
@@ -359,9 +412,8 @@ async def get_weather_by_coords(lat: float, lon: float, display_name: str, lang:
     async with aiohttp.ClientSession() as session:
         async with session.get(url, params=params) as resp:
             data = await resp.json()
-    if "error" in data:
-        raise Exception(data["error"])
-
+    if "error" in data and data["error"]:
+        raise Exception("Ошибка получения погоды")
     curr = data["current"]
     daily = data["daily"]
     tz_offset = data.get("utc_offset_seconds", 0)
@@ -462,6 +514,39 @@ async def location_received(message: types.Message, state: FSMContext):
     await save_location(user_id, message.location.latitude, message.location.longitude)
     await message.answer(await get_text(user_id, "location_saved"), reply_markup=await get_main_kb(lang, message.from_user))
 
+# Профиль
+@dp.message(lambda msg: msg.text in ["👤 Профиль", "👤 Профіль"])
+async def profile_menu(message: types.Message, state: FSMContext):
+    if not await check_status(message): return
+    await state.clear()
+    user_id = message.from_user.id
+    lang = await get_user_language(user_id)
+    nick = await get_nickname(user_id) or await get_text(user_id, "nick_not_set")
+    text = await get_text(user_id, "profile_menu", nick=nick)
+    await message.answer(text, reply_markup=get_profile_kb(lang), parse_mode="HTML")
+
+@dp.message(lambda msg: msg.text in ["✏️ Изменить ник", "✏️ Змінити нік"])
+async def set_nick_start(message: types.Message, state: FSMContext):
+    if not await check_status(message): return
+    await state.set_state(SetNickname.waiting_for_nick)
+    user_id = message.from_user.id
+    lang = await get_user_language(user_id)
+    await message.answer(await get_text(user_id, "set_nick_prompt"), reply_markup=get_cancel_kb(lang))
+
+@dp.message(StateFilter(SetNickname.waiting_for_nick), F.text)
+async def set_nick_finish(message: types.Message, state: FSMContext):
+    if not await check_status(message): return
+    nick = message.text.strip()
+    if not nick or not nick.isalnum() or len(nick) > 20:
+        await message.answer("❌ Некорректный ник. Используйте буквы/цифры, до 20 символов.")
+        return
+    user_id = message.from_user.id
+    await set_nickname(user_id, nick)
+    await state.clear()
+    lang = await get_user_language(user_id)
+    await message.answer(await get_text(user_id, "nick_saved", nick=nick), reply_markup=get_profile_kb(lang))
+
+# --- Погода ---
 @dp.message(lambda msg: msg.text in ["🌟 Погода"])
 async def weather_menu(message: types.Message, state: FSMContext):
     if not await check_status(message): return
@@ -824,22 +909,26 @@ async def toggle_chat(message: types.Message):
     else:
         chat_users.add(user_id)
         await message.answer(await get_text(user_id, "chat_enter"))
+        name = await get_display_name(user_id)
+        for uid in chat_users:
+            if uid != user_id:
+                try:
+                    await bot.send_message(uid, await get_text(uid, "chat_joined", name=name))
+                except:
+                    pass
 
 @dp.message(F.text, ~F.text.in_(["🌟 Погода", "💰 Курсы валют", "🌐 Язык", "🌐 Мова / Язык", "↩ Назад",
                                 "➕ Добавить город", "➕ Додати місто", "💬 Чат", "🔧 Админ", "🔧 Адмін",
                                 "🇷🇺 Русский", "🇺🇦 Українська", "👥 Пользователи", "👥 Користувачі",
                                 "📨 Рассылка", "📨 Розсилка", "📋 Белый лист", "📋 Білий список",
-                                "💬 Управление чатом", "💬 Керування чатом"]))
+                                "💬 Управление чатом", "💬 Керування чатом", "👤 Профиль", "👤 Профіль",
+                                "✏️ Изменить ник", "✏️ Змінити нік"]))
 async def chat_message_handler(message: types.Message):
     if not await check_status(message): return
     user_id = message.from_user.id
     if user_id not in chat_users or not await get_chat_state():
         return
-    try:
-        user = await bot.get_chat(user_id)
-        name = f"@{user.username}" if user.username else user.first_name
-    except:
-        name = f"id{user_id}"
+    name = await get_display_name(user_id)
     for uid in chat_users.copy():
         if uid == user_id: continue
         try:
@@ -858,13 +947,12 @@ async def back_to_main(message: types.Message, state: FSMContext):
     else:
         await message.answer(await get_text(user_id, "welcome_new"), reply_markup=get_location_kb(lang), parse_mode="HTML")
 
-# ---------- ВЕБ-СЕРВЕР ДЛЯ RENDER ----------
+# ---------- ВЕБ-СЕРВЕР ----------
 async def handle(request):
     return web.Response(text="Bot is running")
 
 async def main():
     await init_db()
-    # Запускаем веб-сервер на порту из переменной окружения
     app = web.Application()
     app.router.add_get('/', handle)
     runner = web.AppRunner(app)
@@ -873,7 +961,6 @@ async def main():
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     logging.info(f"Web server started on port {port}")
-    # Запускаем поллинг бота
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
