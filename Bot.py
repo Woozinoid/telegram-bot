@@ -2,8 +2,7 @@ import asyncio
 import json
 import logging
 import random
-import os
-import asyncpg
+import libsql_experimental as libsql
 from datetime import datetime, timezone, timedelta
 
 from aiogram import Bot, Dispatcher, F, types
@@ -18,12 +17,12 @@ from aiogram.types import (
 import aiohttp
 from aiohttp import web
 
-# ---------- НАСТРОЙКИ ----------
+# ---------- НАСТРОЙКИ (вшитые токены) ----------
 TOKEN = "8641527466:AAGSkaTzMJm5X6ExY3vVYRiMLxkwSxOOpnU"
-DATABASE_URL = "postgresql://postgres:9hna5RRR@db.wlyohywetdxyuwcgzjhh.supabase.co:5432/postgres"
+TURSO_URL = "libsql://db-bot-woozinoid.aws-us-east-2.turso.io"
+TURSO_TOKEN = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODQ0MTU2MDUsImlkIjoiMDE5Zjc3NzQtOTcwMS03OTM1LThiMDAtYzI1Mzk3MGEzYTY4Iiwia2lkIjoiOXdHT2NyTlpPLV9xRk80QkdwMFR1V0lfOWI0Q3FjUUJRRG9JM0V6dEFXUSIsInJpZCI6ImQ3NzhkMWMzLTExNDMtNGNmZC04MTJlLWEyMzBjOTVhNTJhZCJ9.R27WAXi6BvDIO6wYPZzmG2OYsjfiDKM1i1Nz2Zr4giYqsphnLPr8XsO_eaEHHij507-Mz55Q6GJ8V-H2g3feDw"
 
 MOSCOW_TZ = timezone(timedelta(hours=3))
-
 ADMIN_USERNAMES = ["Woozinoid", "HwangMinw"]
 chat_users = set()
 
@@ -41,154 +40,166 @@ class Broadcast(StatesGroup):
 class SetNickname(StatesGroup):
     waiting_for_nick = State()
 
-# ---------- БАЗА ДАННЫХ (PostgreSQL) ----------
+# ---------- БАЗА ДАННЫХ (Turso) ----------
+def get_db():
+    return libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
+
 async def init_db():
-    conn = await asyncpg.connect(DATABASE_URL)
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id BIGINT PRIMARY KEY,
-            username TEXT,
-            language TEXT DEFAULT 'ru',
-            reg_date TIMESTAMPTZ DEFAULT NOW(),
-            status TEXT DEFAULT 'active'
-        )
-    """)
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS locations (
-            user_id BIGINT PRIMARY KEY,
-            lat REAL,
-            lon REAL
-        )
-    """)
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS cities (
-            id SERIAL PRIMARY KEY,
-            user_id BIGINT,
-            name TEXT,
-            lat REAL,
-            lon REAL,
-            UNIQUE(user_id, name)
-        )
-    """)
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS chat_state (
-            id INTEGER PRIMARY KEY DEFAULT 1,
-            enabled BOOLEAN DEFAULT FALSE
-        )
-    """)
-    await conn.execute("INSERT INTO chat_state (id, enabled) VALUES (1, FALSE) ON CONFLICT DO NOTHING")
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS profiles (
-            user_id BIGINT PRIMARY KEY,
-            nickname TEXT
-        )
-    """)
-    await conn.close()
+    def _():
+        db = get_db()
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                reg_date TEXT,
+                status TEXT DEFAULT 'active'
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS locations (
+                user_id INTEGER PRIMARY KEY,
+                lat REAL,
+                lon REAL
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS cities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                name TEXT,
+                lat REAL,
+                lon REAL,
+                UNIQUE(user_id, name)
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS chat_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                enabled INTEGER DEFAULT 0
+            )
+        """)
+        db.execute("INSERT OR IGNORE INTO chat_state (id, enabled) VALUES (1, 0)")
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS profiles (
+                user_id INTEGER PRIMARY KEY,
+                nickname TEXT
+            )
+        """)
+        db.commit()
+    await asyncio.get_event_loop().run_in_executor(None, _)
 
 async def create_user(user_id: int, username: str = None):
-    conn = await asyncpg.connect(DATABASE_URL)
-    await conn.execute(
-        "INSERT INTO users (user_id, username) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-        user_id, username
-    )
-    await conn.close()
-
-async def get_user_language(user_id: int) -> str:
-    conn = await asyncpg.connect(DATABASE_URL)
-    row = await conn.fetchrow("SELECT language FROM users WHERE user_id = $1", user_id)
-    await conn.close()
-    return row['language'] if row else "ru"
-
-async def set_user_language(user_id: int, lang: str):
-    conn = await asyncpg.connect(DATABASE_URL)
-    await conn.execute("UPDATE users SET language = $1 WHERE user_id = $2", lang, user_id)
-    await conn.close()
+    def _():
+        db = get_db()
+        db.execute(
+            "INSERT OR IGNORE INTO users (user_id, username, reg_date) VALUES (?, ?, ?)",
+            (user_id, username, datetime.now(MOSCOW_TZ).isoformat())
+        )
+        db.commit()
+    await asyncio.get_event_loop().run_in_executor(None, _)
 
 async def get_user_status(user_id: int) -> str:
-    conn = await asyncpg.connect(DATABASE_URL)
-    row = await conn.fetchrow("SELECT status FROM users WHERE user_id = $1", user_id)
-    await conn.close()
-    return row['status'] if row else "active"
+    def _():
+        db = get_db()
+        r = db.execute("SELECT status FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        return r[0] if r else "active"
+    return await asyncio.get_event_loop().run_in_executor(None, _)
 
 async def set_user_status(user_id: int, status: str):
-    conn = await asyncpg.connect(DATABASE_URL)
-    await conn.execute("UPDATE users SET status = $1 WHERE user_id = $2", status, user_id)
-    await conn.close()
+    def _():
+        db = get_db()
+        db.execute("UPDATE users SET status = ? WHERE user_id = ?", (status, user_id))
+        db.commit()
+    await asyncio.get_event_loop().run_in_executor(None, _)
 
 async def save_location(user_id: int, lat: float, lon: float):
-    conn = await asyncpg.connect(DATABASE_URL)
-    await conn.execute(
-        "INSERT INTO locations (user_id, lat, lon) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO UPDATE SET lat=$2, lon=$3",
-        user_id, lat, lon
-    )
-    await conn.close()
+    def _():
+        db = get_db()
+        db.execute(
+            "INSERT OR REPLACE INTO locations (user_id, lat, lon) VALUES (?, ?, ?)",
+            (user_id, lat, lon)
+        )
+        db.commit()
+    await asyncio.get_event_loop().run_in_executor(None, _)
 
 async def get_location(user_id: int):
-    conn = await asyncpg.connect(DATABASE_URL)
-    row = await conn.fetchrow("SELECT lat, lon FROM locations WHERE user_id = $1", user_id)
-    await conn.close()
-    return (row['lat'], row['lon']) if row else None
+    def _():
+        db = get_db()
+        r = db.execute("SELECT lat, lon FROM locations WHERE user_id = ?", (user_id,)).fetchone()
+        return (r[0], r[1]) if r else None
+    return await asyncio.get_event_loop().run_in_executor(None, _)
 
 async def add_city_db(user_id: int, name: str, lat: float, lon: float) -> bool:
-    try:
-        conn = await asyncpg.connect(DATABASE_URL)
-        await conn.execute(
-            "INSERT INTO cities (user_id, name, lat, lon) VALUES ($1, $2, $3, $4)",
-            user_id, name, lat, lon
-        )
-        await conn.close()
-        return True
-    except:
-        return False
+    def _():
+        try:
+            db = get_db()
+            db.execute(
+                "INSERT INTO cities (user_id, name, lat, lon) VALUES (?, ?, ?, ?)",
+                (user_id, name, lat, lon)
+            )
+            db.commit()
+            return True
+        except:
+            return False
+    return await asyncio.get_event_loop().run_in_executor(None, _)
 
 async def get_cities(user_id: int) -> list:
-    conn = await asyncpg.connect(DATABASE_URL)
-    rows = await conn.fetch("SELECT name, lat, lon FROM cities WHERE user_id = $1", user_id)
-    await conn.close()
-    return [{"name": r['name'], "lat": r['lat'], "lon": r['lon']} for r in rows]
+    def _():
+        db = get_db()
+        rows = db.execute("SELECT name, lat, lon FROM cities WHERE user_id = ?", (user_id,)).fetchall()
+        return [{"name": r[0], "lat": r[1], "lon": r[2]} for r in rows]
+    return await asyncio.get_event_loop().run_in_executor(None, _)
 
 async def city_exists(user_id: int, name: str) -> bool:
-    conn = await asyncpg.connect(DATABASE_URL)
-    row = await conn.fetchrow(
-        "SELECT 1 FROM cities WHERE user_id = $1 AND LOWER(name) = LOWER($2)",
-        user_id, name
-    )
-    await conn.close()
-    return row is not None
+    def _():
+        db = get_db()
+        r = db.execute(
+            "SELECT 1 FROM cities WHERE user_id = ? AND LOWER(name) = LOWER(?)",
+            (user_id, name)
+        ).fetchone()
+        return r is not None
+    return await asyncio.get_event_loop().run_in_executor(None, _)
 
 async def get_chat_state() -> bool:
-    conn = await asyncpg.connect(DATABASE_URL)
-    row = await conn.fetchrow("SELECT enabled FROM chat_state WHERE id = 1")
-    await conn.close()
-    return row['enabled'] if row else False
+    def _():
+        db = get_db()
+        r = db.execute("SELECT enabled FROM chat_state WHERE id = 1").fetchone()
+        return bool(r[0]) if r else False
+    return await asyncio.get_event_loop().run_in_executor(None, _)
 
 async def set_chat_state(enabled: bool):
-    conn = await asyncpg.connect(DATABASE_URL)
-    await conn.execute("UPDATE chat_state SET enabled = $1 WHERE id = 1", enabled)
-    await conn.close()
+    def _():
+        db = get_db()
+        db.execute("UPDATE chat_state SET enabled = ? WHERE id = 1", (int(enabled),))
+        db.commit()
+    await asyncio.get_event_loop().run_in_executor(None, _)
 
 async def get_all_user_ids() -> list:
-    conn = await asyncpg.connect(DATABASE_URL)
-    rows = await conn.fetch("SELECT user_id FROM users")
-    await conn.close()
-    return [r['user_id'] for r in rows]
+    def _():
+        db = get_db()
+        rows = db.execute("SELECT user_id FROM users").fetchall()
+        return [r[0] for r in rows]
+    return await asyncio.get_event_loop().run_in_executor(None, _)
 
 async def set_nickname(user_id: int, nick: str):
-    conn = await asyncpg.connect(DATABASE_URL)
-    await conn.execute(
-        "INSERT INTO profiles (user_id, nickname) VALUES ($1, $2) ON CONFLICT (user_id) DO UPDATE SET nickname = $2",
-        user_id, nick
-    )
-    await conn.close()
+    def _():
+        db = get_db()
+        db.execute(
+            "INSERT OR REPLACE INTO profiles (user_id, nickname) VALUES (?, ?)",
+            (user_id, nick)
+        )
+        db.commit()
+    await asyncio.get_event_loop().run_in_executor(None, _)
 
 async def get_nickname(user_id: int) -> str | None:
-    conn = await asyncpg.connect(DATABASE_URL)
-    row = await conn.fetchrow("SELECT nickname FROM profiles WHERE user_id = $1", user_id)
-    await conn.close()
-    return row['nickname'] if row else None
+    def _():
+        db = get_db()
+        r = db.execute("SELECT nickname FROM profiles WHERE user_id = ?", (user_id,)).fetchone()
+        return r[0] if r else None
+    return await asyncio.get_event_loop().run_in_executor(None, _)
 
-# ---------- ПОГОДНЫЕ КОДЫ ----------
-WEATHER_CODES_RU = {
+# ---------- ПОГОДНЫЕ КОДЫ (только русские) ----------
+WEATHER_CODES = {
     0: "Ясно", 1: "Преимущественно ясно", 2: "Переменная облачность",
     3: "Пасмурно", 45: "Туман", 48: "Иней", 51: "Морось",
     53: "Морось", 55: "Сильная морось", 61: "Дождь",
@@ -196,15 +207,9 @@ WEATHER_CODES_RU = {
     73: "Снегопад", 75: "Сильный снег", 80: "Кратковременный дождь",
     95: "Гроза", 96: "Гроза с градом", 99: "Гроза с градом"
 }
-WEATHER_CODES_UK = {
-    0: "Ясно", 1: "Переважно ясно", 2: "Мінлива хмарність",
-    3: "Хмарно", 45: "Туман", 51: "Мряка", 61: "Дощ",
-    63: "Сильний дощ", 65: "Злива", 71: "Сніг", 73: "Снігопад",
-    75: "Сильний сніг", 95: "Гроза", 96: "Гроза з градом"
-}
 
-# ---------- ПЕРЕВОДЫ ----------
-RU = {
+# ---------- РУССКИЕ ТЕКСТЫ ----------
+TEXT = {
     "welcome_back": "🌈 <b>С возвращением!</b> Выберите действие:",
     "welcome_new": "🌈 <b>Привет!</b> Отправьте геолокацию, чтобы открыть все функции.",
     "location_saved": "✅ Геолокация сохранена!",
@@ -219,7 +224,6 @@ RU = {
     "weather_error": "❌ Ошибка: {error}",
     "currency_menu": "💰 Выберите валютную пару:",
     "loading_currency": "⏳ Загружаю данные по {pair}...",
-    "language_select": "🌐 Выберите язык / Виберіть мову:",
     "banned_msg": "⛔ Вы забанены. Обратитесь к администратору.",
     "muted_msg": "🔇 Вы временно не можете писать.",
     "chat_enter": "💬 Вы вошли в общий чат.",
@@ -230,7 +234,7 @@ RU = {
     "whitelist_empty": "📋 Список заблокированных пуст.",
     "broadcast_sent": "✅ Сообщение отправлено {count} пользователям.",
     "admin_menu": "🔧 <b>Админ-панель</b>",
-    "main_menu": [["🌟 Погода", "💰 Курсы валют"], ["🌐 Язык", "📍 Обновить геолокацию"], ["👤 Профиль"]],
+    "main_menu": [["🌟 Погода", "💰 Курсы валют"], ["📍 Обновить геолокацию"], ["👤 Профиль"]],
     "weather_frame": "🌍 {city}\n🌤 {desc}\n🌡 Температура: {temp}°C (ощ. {feels}°C)\n☁️ Облачность: {cloudcover}%\n💧 Влажность: {humidity}%\n🔵 Давление: {pressure} мм рт.ст.\n🌅 Восход: {sunrise}\n🌇 Закат: {sunset}",
     "now_in_city": "🌈 Сейчас в {city}: {desc}",
     "fiat_info": "📅 <b>{date}</b> 🕒 {time} (МСК)\n\n<b>{pair}</b>\n💰 Текущий курс: <b>{current:.2f} ₽</b>\n📉 За 24 часа: {arrow_24} {change_24:+.2f} ₽ ({change_24_pct:+.2f}%)\n{week_info}",
@@ -242,57 +246,15 @@ RU = {
     "chat_joined": "💬 Пользователь {name} присоединился к чату."
 }
 
-UK = {
-    "welcome_back": "🌈 <b>З поверненням!</b> Оберіть дію:",
-    "welcome_new": "🌈 <b>Привіт!</b> Надішліть геолокацію.",
-    "location_saved": "✅ Геолокацію збережено!",
-    "weather_menu": "🌟 Виберіть місто або додайте нове:",
-    "add_city_prompt": "🏙 Введіть назву міста:",
-    "cancel": "↩ Назад",
-    "searching_coords": "⏳ Шукаю координати...",
-    "city_not_found": "❌ Не вдалося знайти місто «{city}».",
-    "city_already_exists": "❗ Місто «{city}» вже є у списку.",
-    "city_added": "✅ Місто «{city}» додано!",
-    "loading_weather": "⏳ Завантажую погоду для «{city}»...",
-    "weather_error": "❌ Помилка: {error}",
-    "currency_menu": "💰 Виберіть валютну пару:",
-    "loading_currency": "⏳ Завантажую дані для {pair}...",
-    "language_select": "🌐 Виберіть мову:",
-    "banned_msg": "⛔ Ви забанені.",
-    "muted_msg": "🔇 Ви тимчасово не можете писати.",
-    "chat_enter": "💬 Ви увійшли до чату.",
-    "chat_leave": "💬 Ви вийшли з чату.",
-    "chat_off": "💬 Чат тимчасово вимкнено.",
-    "chat_global_on": "✅ Чат увімкнено.",
-    "chat_global_off": "🛑 Чат вимкнено.",
-    "whitelist_empty": "📋 Список порожній.",
-    "broadcast_sent": "✅ Надіслано {count} користувачам.",
-    "admin_menu": "🔧 <b>Адмін-панель</b>",
-    "main_menu": [["🌟 Погода", "💰 Курсы валют"], ["🌐 Мова", "📍 Оновити геолокацію"], ["👤 Профіль"]],
-    "weather_frame": "🌍 {city}\n🌤 {desc}\n🌡 Температура: {temp}°C (відч. {feels}°C)\n☁️ Хмарність: {cloudcover}%\n💧 Вологість: {humidity}%\n🔵 Тиск: {pressure} мм рт.ст.\n🌅 Схід: {sunrise}\n🌇 Захід: {sunset}",
-    "now_in_city": "🌈 Зараз у {city}: {desc}",
-    "fiat_info": "📅 <b>{date}</b> 🕒 {time} (МСК)\n\n<b>{pair}</b>\n💰 Поточний курс: <b>{current:.2f} ₽</b>\n📉 За 24 години: {arrow_24} {change_24:+.2f} ₽ ({change_24_pct:+.2f}%)\n{week_info}",
-    "ton_info": "📅 <b>{date}</b> 🕒 {time} (МСК)\n\n<b>💎 TON/RUB</b>\n💰 Поточний курс: <b>{ton_rub:.2f} ₽</b> (${ton_usd:.4f})\n📉 За 24 години: {arrow} {change_pct:+.2f}%",
-    "profile_menu": "👤 <b>Профіль</b>\nВаш нік: {nick}\nОберіть дію:",
-    "set_nick_prompt": "✏️ Введіть новий нікнейм (тільки літери, цифри, без пробілів):",
-    "nick_saved": "✅ Нікнейм збережено: {nick}",
-    "nick_not_set": "не задано",
-    "chat_joined": "💬 Користувач {name} приєднався до чату."
-}
-
 MONTHS_RU = ["", "января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"]
 WEEKDAYS_RU = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
-MONTHS_UK = ["", "січня", "лютого", "березня", "квітня", "травня", "червня", "липня", "серпня", "вересня", "жовтня", "листопада", "грудня"]
-WEEKDAYS_UK = ["понеділок", "вівторок", "середа", "четвер", "п'ятниця", "субота", "неділя"]
 
 # ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
 def is_admin(user: types.User) -> bool:
     return user.username is not None and user.username.lower() in [u.lower() for u in ADMIN_USERNAMES]
 
-async def get_text(user_id, key, **kwargs):
-    lang = await get_user_language(user_id)
-    t = RU if lang == 'ru' else UK
-    text = t[key]
+def get_text(key, **kwargs):
+    text = TEXT[key]
     if kwargs:
         text = text.format(**kwargs)
     return text
@@ -301,10 +263,10 @@ async def check_status(message: types.Message):
     user_id = message.from_user.id
     status = await get_user_status(user_id)
     if status == "banned":
-        await message.answer(await get_text(user_id, "banned_msg"))
+        await message.answer(get_text("banned_msg"))
         return False
     elif status == "muted":
-        await message.answer(await get_text(user_id, "muted_msg"))
+        await message.answer(get_text("muted_msg"))
         return False
     return True
 
@@ -321,64 +283,51 @@ async def get_display_name(user_id: int) -> str:
         return f"id{user_id}"
 
 # ---------- КЛАВИАТУРЫ ----------
-def get_location_kb(lang):
+def get_location_kb():
     return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📍 Отправить геолокацию" if lang=='ru' else "📍 Надіслати геолокацію", request_location=True)]],
+        keyboard=[[KeyboardButton(text="📍 Отправить геолокацию", request_location=True)]],
         resize_keyboard=True
     )
 
-async def get_main_kb(lang, user: types.User = None):
-    t = RU if lang == 'ru' else UK
-    buttons = []
-    for row in t["main_menu"]:
-        buttons.append([KeyboardButton(text=btn) for btn in row])
-    buttons[-2][1] = KeyboardButton(text=buttons[-2][1].text, request_location=True)
+async def get_main_kb(user: types.User = None):
+    buttons = [
+        [KeyboardButton(text="🌟 Погода"), KeyboardButton(text="💰 Курсы валют")],
+        [KeyboardButton(text="📍 Обновить геолокацию", request_location=True)],
+        [KeyboardButton(text="👤 Профиль")]
+    ]
     chat_enabled = await get_chat_state()
     if chat_enabled:
         buttons.append([KeyboardButton(text="💬 Чат")])
     if user and is_admin(user):
-        buttons.append([KeyboardButton(text="🔧 Админ" if lang=='ru' else "🔧 Адмін")])
+        buttons.append([KeyboardButton(text="🔧 Админ")])
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
-async def get_cities_kb(user_id, lang):
+async def get_cities_kb(user_id):
     cities = await get_cities(user_id)
-    t = RU if lang == 'ru' else UK
     buttons = []
     for city in cities:
         buttons.append([KeyboardButton(text=f"🏙 {city['name']}")])
-    buttons.append([KeyboardButton(text="➕ Добавить город" if lang=='ru' else "➕ Додати місто")])
-    buttons.append([KeyboardButton(text=t["cancel"])])
+    buttons.append([KeyboardButton(text="➕ Добавить город")])
+    buttons.append([KeyboardButton(text="↩ Назад")])
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
-def get_cancel_kb(lang):
-    t = RU if lang == 'ru' else UK
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=t["cancel"])]], resize_keyboard=True)
+def get_cancel_kb():
+    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="↩ Назад")]], resize_keyboard=True)
 
-def get_currency_kb(lang):
-    t = RU if lang == 'ru' else UK
+def get_currency_kb():
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🇺🇸 USD/RUB"), KeyboardButton(text="🇪🇺 EUR/RUB")],
             [KeyboardButton(text="💎 TON/RUB")],
-            [KeyboardButton(text=t["cancel"])]
-        ],
-        resize_keyboard=True
-    )
-
-def get_language_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🇷🇺 Русский"), KeyboardButton(text="🇺🇦 Українська")],
             [KeyboardButton(text="↩ Назад")]
         ],
         resize_keyboard=True
     )
 
-def get_profile_kb(lang):
-    t = RU if lang == 'ru' else UK
+def get_profile_kb():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="✏️ Изменить ник" if lang=='ru' else "✏️ Змінити нік")],
+            [KeyboardButton(text="✏️ Изменить ник")],
             [KeyboardButton(text="↩ Назад")]
         ],
         resize_keyboard=True
@@ -400,7 +349,7 @@ async def geocode_city(city_name: str) -> tuple:
         logging.error(f"Geocode error: {e}")
     return None
 
-async def get_weather_by_coords(lat: float, lon: float, display_name: str, lang: str):
+async def get_weather_by_coords(lat: float, lon: float, display_name: str):
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat, "longitude": lon,
@@ -420,15 +369,9 @@ async def get_weather_by_coords(lat: float, lon: float, display_name: str, lang:
     local_tz = timezone(timedelta(seconds=tz_offset))
     now_local = datetime.now(local_tz)
 
-    if lang == 'ru':
-        months = MONTHS_RU; weekdays = WEEKDAYS_RU
-        desc = WEATHER_CODES_RU.get(curr["weather_code"], "Неизвестно")
-    else:
-        months = MONTHS_UK; weekdays = WEEKDAYS_UK
-        desc = WEATHER_CODES_UK.get(curr["weather_code"], "Невідомо")
-
-    month_str = months[now_local.month]
-    weekday_str = weekdays[now_local.weekday()]
+    desc = WEATHER_CODES.get(curr["weather_code"], "Неизвестно")
+    month_str = MONTHS_RU[now_local.month]
+    weekday_str = WEEKDAYS_RU[now_local.weekday()]
     local_time_str = f"{now_local.day} {month_str} {now_local.year}, {weekday_str} {now_local.strftime('%H:%M:%S')}"
 
     sunrise_utc = datetime.fromisoformat(daily["sunrise"][0]).replace(tzinfo=timezone.utc).astimezone(local_tz)
@@ -497,12 +440,11 @@ async def start_cmd(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
     await create_user(user_id, message.from_user.username)
-    lang = await get_user_language(user_id)
     loc = await get_location(user_id)
     if loc:
-        await message.answer(await get_text(user_id, "welcome_back"), reply_markup=await get_main_kb(lang, message.from_user), parse_mode="HTML")
+        await message.answer(get_text("welcome_back"), reply_markup=await get_main_kb(message.from_user), parse_mode="HTML")
     else:
-        await message.answer(await get_text(user_id, "welcome_new"), reply_markup=get_location_kb(lang), parse_mode="HTML")
+        await message.answer(get_text("welcome_new"), reply_markup=get_location_kb(), parse_mode="HTML")
 
 @dp.message(F.location)
 async def location_received(message: types.Message, state: FSMContext):
@@ -510,28 +452,24 @@ async def location_received(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
     await create_user(user_id, message.from_user.username)
-    lang = await get_user_language(user_id)
     await save_location(user_id, message.location.latitude, message.location.longitude)
-    await message.answer(await get_text(user_id, "location_saved"), reply_markup=await get_main_kb(lang, message.from_user))
+    await message.answer(get_text("location_saved"), reply_markup=await get_main_kb(message.from_user))
 
 # Профиль
-@dp.message(lambda msg: msg.text in ["👤 Профиль", "👤 Профіль"])
+@dp.message(lambda msg: msg.text == "👤 Профиль")
 async def profile_menu(message: types.Message, state: FSMContext):
     if not await check_status(message): return
     await state.clear()
     user_id = message.from_user.id
-    lang = await get_user_language(user_id)
-    nick = await get_nickname(user_id) or await get_text(user_id, "nick_not_set")
-    text = await get_text(user_id, "profile_menu", nick=nick)
-    await message.answer(text, reply_markup=get_profile_kb(lang), parse_mode="HTML")
+    nick = await get_nickname(user_id) or get_text("nick_not_set")
+    text = get_text("profile_menu", nick=nick)
+    await message.answer(text, reply_markup=get_profile_kb(), parse_mode="HTML")
 
-@dp.message(lambda msg: msg.text in ["✏️ Изменить ник", "✏️ Змінити нік"])
+@dp.message(lambda msg: msg.text == "✏️ Изменить ник")
 async def set_nick_start(message: types.Message, state: FSMContext):
     if not await check_status(message): return
     await state.set_state(SetNickname.waiting_for_nick)
-    user_id = message.from_user.id
-    lang = await get_user_language(user_id)
-    await message.answer(await get_text(user_id, "set_nick_prompt"), reply_markup=get_cancel_kb(lang))
+    await message.answer(get_text("set_nick_prompt"), reply_markup=get_cancel_kb())
 
 @dp.message(StateFilter(SetNickname.waiting_for_nick), F.text)
 async def set_nick_finish(message: types.Message, state: FSMContext):
@@ -543,27 +481,23 @@ async def set_nick_finish(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     await set_nickname(user_id, nick)
     await state.clear()
-    lang = await get_user_language(user_id)
-    await message.answer(await get_text(user_id, "nick_saved", nick=nick), reply_markup=get_profile_kb(lang))
+    await message.answer(get_text("nick_saved", nick=nick), reply_markup=get_profile_kb())
 
 # --- Погода ---
-@dp.message(lambda msg: msg.text in ["🌟 Погода"])
+@dp.message(lambda msg: msg.text == "🌟 Погода")
 async def weather_menu(message: types.Message, state: FSMContext):
     if not await check_status(message): return
     await state.clear()
     user_id = message.from_user.id
-    lang = await get_user_language(user_id)
-    await message.answer(await get_text(user_id, "weather_menu"), reply_markup=await get_cities_kb(user_id, lang))
+    await message.answer(get_text("weather_menu"), reply_markup=await get_cities_kb(user_id))
 
-@dp.message(lambda msg: msg.text in ["➕ Добавить город", "➕ Додати місто"])
+@dp.message(lambda msg: msg.text == "➕ Добавить город")
 async def add_city_start(message: types.Message, state: FSMContext):
     if not await check_status(message): return
     await state.set_state(AddCity.waiting_for_name)
-    user_id = message.from_user.id
-    lang = await get_user_language(user_id)
-    await message.answer(await get_text(user_id, "add_city_prompt"), reply_markup=get_cancel_kb(lang))
+    await message.answer(get_text("add_city_prompt"), reply_markup=get_cancel_kb())
 
-@dp.message(StateFilter(AddCity.waiting_for_name), lambda msg: msg.text in ["↩ Назад"])
+@dp.message(StateFilter(AddCity.waiting_for_name), lambda msg: msg.text == "↩ Назад")
 async def add_city_cancel(message: types.Message, state: FSMContext):
     await state.clear()
     await weather_menu(message, state)
@@ -573,24 +507,23 @@ async def add_city_name(message: types.Message, state: FSMContext):
     if not await check_status(message): return
     city_name = message.text.strip()
     user_id = message.from_user.id
-    lang = await get_user_language(user_id)
     if not city_name:
-        await message.answer("Введите название" if lang=='ru' else "Введіть назву")
+        await message.answer("Введите название")
         return
-    msg = await message.answer(await get_text(user_id, "searching_coords"))
+    msg = await message.answer(get_text("searching_coords"))
     coords = await geocode_city(city_name)
     if not coords:
-        await msg.edit_text(await get_text(user_id, "city_not_found", city=city_name))
+        await msg.edit_text(get_text("city_not_found", city=city_name))
         return
     lat, lon = coords
     if await city_exists(user_id, city_name):
-        await msg.edit_text(await get_text(user_id, "city_already_exists", city=city_name))
+        await msg.edit_text(get_text("city_already_exists", city=city_name))
         await state.clear()
         await weather_menu(message, state)
         return
     await add_city_db(user_id, city_name, lat, lon)
     await state.clear()
-    await msg.edit_text(await get_text(user_id, "city_added", city=city_name))
+    await msg.edit_text(get_text("city_added", city=city_name))
     await weather_menu(message, state)
 
 @dp.message(lambda msg: msg.text and msg.text.startswith("🏙 "))
@@ -599,22 +532,20 @@ async def show_city_weather(message: types.Message, state: FSMContext):
     await state.clear()
     city_name = message.text[2:].strip()
     user_id = message.from_user.id
-    lang = await get_user_language(user_id)
     cities = await get_cities(user_id)
     city = next((c for c in cities if c['name'] == city_name), None)
     if not city:
-        await message.answer("Город не найден" if lang=='ru' else "Місто не знайдено")
+        await message.answer("Город не найден")
         return
-    msg = await message.answer(await get_text(user_id, "loading_weather", city=city_name))
+    msg = await message.answer(get_text("loading_weather", city=city_name))
     try:
-        weather = await get_weather_by_coords(city["lat"], city["lon"], city_name, lang)
+        weather = await get_weather_by_coords(city["lat"], city["lon"], city_name)
     except Exception as e:
-        await msg.edit_text(await get_text(user_id, "weather_error", error=str(e)))
+        await msg.edit_text(get_text("weather_error", error=str(e)))
         return
 
-    t = RU if lang == 'ru' else UK
-    frame = t["weather_frame"].format(**weather)
-    now_text = t["now_in_city"].format(city=weather['city'], desc=weather['desc'])
+    frame = TEXT["weather_frame"].format(**weather)
+    now_text = TEXT["now_in_city"].format(city=weather['city'], desc=weather['desc'])
     text = f"📅 <b>{weather['local_time']}</b>\n\n{frame}\n\n<i>{now_text}</i>"
     await msg.edit_text(text, parse_mode="HTML")
     await weather_menu(message, state)
@@ -624,17 +555,13 @@ async def show_city_weather(message: types.Message, state: FSMContext):
 async def currency_menu(message: types.Message, state: FSMContext):
     if not await check_status(message): return
     await state.clear()
-    user_id = message.from_user.id
-    lang = await get_user_language(user_id)
-    await message.answer(await get_text(user_id, "currency_menu"), reply_markup=get_currency_kb(lang))
+    await message.answer(get_text("currency_menu"), reply_markup=get_currency_kb())
 
 @dp.message(lambda msg: msg.text in ["🇺🇸 USD/RUB", "🇪🇺 EUR/RUB"])
 async def show_fiat_currency(message: types.Message, state: FSMContext):
     if not await check_status(message): return
     pair = message.text.split()[1]
-    user_id = message.from_user.id
-    lang = await get_user_language(user_id)
-    msg = await message.answer(await get_text(user_id, "loading_currency", pair=pair))
+    msg = await message.answer(get_text("loading_currency", pair=pair))
     try:
         cbr_data = await get_cbr_currency()
         valutes = cbr_data["Valute"]
@@ -662,11 +589,8 @@ async def show_fiat_currency(message: types.Message, state: FSMContext):
             week_info = "📆 За неделю: нет данных"
         now_moscow = datetime.now(MOSCOW_TZ)
         time_str = now_moscow.strftime("%H:%M:%S")
-        if lang == 'ru':
-            date_str = f"{now_moscow.day} {MONTHS_RU[now_moscow.month]} {now_moscow.year}, {WEEKDAYS_RU[now_moscow.weekday()]}"
-        else:
-            date_str = f"{now_moscow.day} {MONTHS_UK[now_moscow.month]} {now_moscow.year}, {WEEKDAYS_UK[now_moscow.weekday()]}"
-        info = await get_text(user_id, "fiat_info", date=date_str, time=time_str, pair=pair, current=current, arrow_24=arrow_24, change_24=change_24, change_24_pct=change_24_pct, week_info=week_info)
+        date_str = f"{now_moscow.day} {MONTHS_RU[now_moscow.month]} {now_moscow.year}, {WEEKDAYS_RU[now_moscow.weekday()]}"
+        info = get_text("fiat_info", date=date_str, time=time_str, pair=pair, current=current, arrow_24=arrow_24, change_24=change_24, change_24_pct=change_24_pct, week_info=week_info)
         await msg.edit_text(info, parse_mode="HTML")
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка: {e}")
@@ -674,8 +598,6 @@ async def show_fiat_currency(message: types.Message, state: FSMContext):
 @dp.message(lambda msg: msg.text == "💎 TON/RUB")
 async def show_ton(message: types.Message, state: FSMContext):
     if not await check_status(message): return
-    user_id = message.from_user.id
-    lang = await get_user_language(user_id)
     msg = await message.answer("⏳ Загружаю данные TON...")
     try:
         ton = await get_ton_price()
@@ -689,48 +611,27 @@ async def show_ton(message: types.Message, state: FSMContext):
         arrow = "🔺" if change_pct > 0 else "🔻" if change_pct < 0 else "▪️"
         now_moscow = datetime.now(MOSCOW_TZ)
         time_str = now_moscow.strftime("%H:%M:%S")
-        if lang == 'ru':
-            date_str = f"{now_moscow.day} {MONTHS_RU[now_moscow.month]} {now_moscow.year}, {WEEKDAYS_RU[now_moscow.weekday()]}"
-        else:
-            date_str = f"{now_moscow.day} {MONTHS_UK[now_moscow.month]} {now_moscow.year}, {WEEKDAYS_UK[now_moscow.weekday()]}"
-        info = await get_text(user_id, "ton_info", date=date_str, time=time_str, ton_rub=ton_rub, ton_usd=ton["usd"], arrow=arrow, change_pct=change_pct)
+        date_str = f"{now_moscow.day} {MONTHS_RU[now_moscow.month]} {now_moscow.year}, {WEEKDAYS_RU[now_moscow.weekday()]}"
+        info = get_text("ton_info", date=date_str, time=time_str, ton_rub=ton_rub, ton_usd=ton["usd"], arrow=arrow, change_pct=change_pct)
         await msg.edit_text(info, parse_mode="HTML")
     except Exception as e:
         await msg.edit_text(f"❌ Ошибка: {e}")
 
-# --- Язык ---
-@dp.message(lambda msg: msg.text in ["🌐 Язык", "🌐 Мова / Язык"])
-async def language_menu(message: types.Message, state: FSMContext):
-    await message.answer(await get_text(message.from_user.id, "language_select"), reply_markup=get_language_kb())
-
-@dp.message(lambda msg: msg.text in ["🇷🇺 Русский", "🇺🇦 Українська"])
-async def set_language(message: types.Message, state: FSMContext):
-    user_id = message.from_user.id
-    lang = 'ru' if message.text == "🇷🇺 Русский" else 'uk'
-    await set_user_language(user_id, lang)
-    loc = await get_location(user_id)
-    if loc:
-        await message.answer(await get_text(user_id, "welcome_back"), reply_markup=await get_main_kb(lang, message.from_user), parse_mode="HTML")
-    else:
-        await message.answer(await get_text(user_id, "welcome_new"), reply_markup=get_location_kb(lang), parse_mode="HTML")
-
 # --- АДМИН-ПАНЕЛЬ ---
-@dp.message(lambda msg: msg.text in ["🔧 Админ", "🔧 Адмін"])
+@dp.message(lambda msg: msg.text == "🔧 Админ")
 async def admin_menu(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user): return
     await state.clear()
-    user_id = message.from_user.id
-    lang = await get_user_language(user_id)
     kb = [
-        [KeyboardButton(text="👥 Пользователи" if lang=='ru' else "👥 Користувачі")],
-        [KeyboardButton(text="📨 Рассылка" if lang=='ru' else "📨 Розсилка")],
-        [KeyboardButton(text="💬 Управление чатом" if lang=='ru' else "💬 Керування чатом")],
-        [KeyboardButton(text="📋 Белый лист" if lang=='ru' else "📋 Білий список")],
+        [KeyboardButton(text="👥 Пользователи")],
+        [KeyboardButton(text="📨 Рассылка")],
+        [KeyboardButton(text="💬 Управление чатом")],
+        [KeyboardButton(text="📋 Белый лист")],
         [KeyboardButton(text="↩ Назад")]
     ]
-    await message.answer(await get_text(user_id, "admin_menu"), reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True), parse_mode="HTML")
+    await message.answer(get_text("admin_menu"), reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True), parse_mode="HTML")
 
-@dp.message(lambda msg: msg.text in ["👥 Пользователи", "👥 Користувачі"])
+@dp.message(lambda msg: msg.text == "👥 Пользователи")
 async def admin_users_list(message: types.Message):
     if not is_admin(message.from_user): return
     user_ids = await get_all_user_ids()
@@ -753,13 +654,12 @@ async def admin_users_list(message: types.Message):
 async def user_actions_menu(call: CallbackQuery):
     if not is_admin(call.from_user): return
     target_id = int(call.data.split("_")[1])
-    lang = await get_user_language(call.from_user.id)
     status = await get_user_status(target_id)
     kb = InlineKeyboardMarkup(inline_keyboard=[])
     if status != "banned":
-        kb.inline_keyboard.append([InlineKeyboardButton(text="Забанить" if lang=='ru' else "Забанити", callback_data=f"ban_{target_id}")])
+        kb.inline_keyboard.append([InlineKeyboardButton(text="Забанить", callback_data=f"ban_{target_id}")])
     if status != "muted":
-        kb.inline_keyboard.append([InlineKeyboardButton(text="Замутить" if lang=='ru' else "Замутити", callback_data=f"mute_{target_id}")])
+        kb.inline_keyboard.append([InlineKeyboardButton(text="Замутить", callback_data=f"mute_{target_id}")])
     kb.inline_keyboard.append([InlineKeyboardButton(text="↩ Назад", callback_data="back_to_users")])
     await call.message.edit_reply_markup(reply_markup=kb)
 
@@ -783,7 +683,7 @@ async def mute_user(call: CallbackQuery):
 async def back_to_users(call: CallbackQuery):
     await admin_users_list(call.message)
 
-@dp.message(lambda msg: msg.text in ["📋 Белый лист", "📋 Білий список"])
+@dp.message(lambda msg: msg.text == "📋 Белый лист")
 async def whitelist_menu(message: types.Message):
     if not is_admin(message.from_user): return
     user_ids = await get_all_user_ids()
@@ -793,8 +693,7 @@ async def whitelist_menu(message: types.Message):
         if status != "active":
             blocked.append((uid, status))
     if not blocked:
-        lang = await get_user_language(message.from_user.id)
-        await message.answer(RU["whitelist_empty"] if lang=='ru' else UK["whitelist_empty"])
+        await message.answer(get_text("whitelist_empty"))
         return
     markup = InlineKeyboardMarkup(inline_keyboard=[])
     for uid, st in blocked:
@@ -827,15 +726,13 @@ async def unmute_user(call: CallbackQuery):
     await call.answer(f"Пользователь {target_id} размучен")
     await whitelist_menu(call.message)
 
-@dp.message(lambda msg: msg.text in ["📨 Рассылка", "📨 Розсилка"])
+@dp.message(lambda msg: msg.text == "📨 Рассылка")
 async def broadcast_start(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user): return
     await state.set_state(Broadcast.waiting_for_message)
-    user_id = message.from_user.id
-    lang = await get_user_language(user_id)
-    await message.answer("📨 Введите сообщение для рассылки:", reply_markup=get_cancel_kb(lang))
+    await message.answer("📨 Введите сообщение для рассылки:", reply_markup=get_cancel_kb())
 
-@dp.message(StateFilter(Broadcast.waiting_for_message), lambda msg: msg.text in ["↩ Назад"])
+@dp.message(StateFilter(Broadcast.waiting_for_message), lambda msg: msg.text == "↩ Назад")
 async def broadcast_cancel(message: types.Message, state: FSMContext):
     await state.clear()
     await admin_menu(message, state)
@@ -852,16 +749,12 @@ async def broadcast_send(message: types.Message, state: FSMContext):
             sent += 1
         except Exception as e:
             logging.warning(f"Не удалось отправить сообщение {uid}: {e}")
-    user_id = message.from_user.id
-    lang = await get_user_language(user_id)
-    await message.answer(await get_text(user_id, "broadcast_sent", count=sent), reply_markup=await get_main_kb(lang, message.from_user))
+    await message.answer(get_text("broadcast_sent", count=sent), reply_markup=await get_main_kb(message.from_user))
 
 # Управление чатом
-@dp.message(lambda msg: msg.text in ["💬 Управление чатом", "💬 Керування чатом"])
+@dp.message(lambda msg: msg.text == "💬 Управление чатом")
 async def admin_chat_manage(message: types.Message):
     if not is_admin(message.from_user): return
-    user_id = message.from_user.id
-    lang = await get_user_language(user_id)
     chat_enabled = await get_chat_state()
     count = len(chat_users)
     status = "включён" if chat_enabled else "выключен"
@@ -901,28 +794,26 @@ async def toggle_chat(message: types.Message):
     user_id = message.from_user.id
     chat_enabled = await get_chat_state()
     if not chat_enabled:
-        await message.answer(await get_text(user_id, "chat_off"))
+        await message.answer(get_text("chat_off"))
         return
     if user_id in chat_users:
         chat_users.discard(user_id)
-        await message.answer(await get_text(user_id, "chat_leave"))
+        await message.answer(get_text("chat_leave"))
     else:
         chat_users.add(user_id)
-        await message.answer(await get_text(user_id, "chat_enter"))
+        await message.answer(get_text("chat_enter"))
         name = await get_display_name(user_id)
         for uid in chat_users:
             if uid != user_id:
                 try:
-                    await bot.send_message(uid, await get_text(uid, "chat_joined", name=name))
+                    await bot.send_message(uid, get_text("chat_joined", name=name))
                 except:
                     pass
 
-@dp.message(F.text, ~F.text.in_(["🌟 Погода", "💰 Курсы валют", "🌐 Язык", "🌐 Мова / Язык", "↩ Назад",
-                                "➕ Добавить город", "➕ Додати місто", "💬 Чат", "🔧 Админ", "🔧 Адмін",
-                                "🇷🇺 Русский", "🇺🇦 Українська", "👥 Пользователи", "👥 Користувачі",
-                                "📨 Рассылка", "📨 Розсилка", "📋 Белый лист", "📋 Білий список",
-                                "💬 Управление чатом", "💬 Керування чатом", "👤 Профиль", "👤 Профіль",
-                                "✏️ Изменить ник", "✏️ Змінити нік"]))
+@dp.message(F.text, ~F.text.in_(["🌟 Погода", "💰 Курсы валют", "↩ Назад",
+                                "➕ Добавить город", "💬 Чат", "🔧 Админ",
+                                "👥 Пользователи", "📨 Рассылка", "📋 Белый лист",
+                                "💬 Управление чатом", "👤 Профиль", "✏️ Изменить ник"]))
 async def chat_message_handler(message: types.Message):
     if not await check_status(message): return
     user_id = message.from_user.id
@@ -940,12 +831,11 @@ async def chat_message_handler(message: types.Message):
 async def back_to_main(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
-    lang = await get_user_language(user_id)
     loc = await get_location(user_id)
     if loc:
-        await message.answer(await get_text(user_id, "welcome_back"), reply_markup=await get_main_kb(lang, message.from_user), parse_mode="HTML")
+        await message.answer(get_text("welcome_back"), reply_markup=await get_main_kb(message.from_user), parse_mode="HTML")
     else:
-        await message.answer(await get_text(user_id, "welcome_new"), reply_markup=get_location_kb(lang), parse_mode="HTML")
+        await message.answer(get_text("welcome_new"), reply_markup=get_location_kb(), parse_mode="HTML")
 
 # ---------- ВЕБ-СЕРВЕР ----------
 async def handle(request):
