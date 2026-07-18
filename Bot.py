@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import random
-import libsql_experimental as libsql
+import os
 from datetime import datetime, timezone, timedelta
 
 from aiogram import Bot, Dispatcher, F, types
@@ -17,14 +17,19 @@ from aiogram.types import (
 import aiohttp
 from aiohttp import web
 
-# ---------- НАСТРОЙКИ (вшитые токены) ----------
+# ---------- НАСТРОЙКИ ----------
 TOKEN = "8641527466:AAGSkaTzMJm5X6ExY3vVYRiMLxkwSxOOpnU"
-TURSO_URL = "libsql://db-bot-woozinoid.aws-us-east-2.turso.io"
-TURSO_TOKEN = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJhIjoicnciLCJpYXQiOjE3ODQ0MTU2MDUsImlkIjoiMDE5Zjc3NzQtOTcwMS03OTM1LThiMDAtYzI1Mzk3MGEzYTY4Iiwia2lkIjoiOXdHT2NyTlpPLV9xRk80QkdwMFR1V0lfOWI0Q3FjUUJRRG9JM0V6dEFXUSIsInJpZCI6ImQ3NzhkMWMzLTExNDMtNGNmZC04MTJlLWEyMzBjOTVhNTJhZCJ9.R27WAXi6BvDIO6wYPZzmG2OYsjfiDKM1i1Nz2Zr4giYqsphnLPr8XsO_eaEHHij507-Mz55Q6GJ8V-H2g3feDw"
-
 MOSCOW_TZ = timezone(timedelta(hours=3))
+
 ADMIN_USERNAMES = ["Woozinoid", "HwangMinw"]
-chat_users = set()
+chat_users = set()                     # кто сейчас в чате
+
+# Хранилища в памяти
+user_locations = {}                    # {user_id: (lat, lon)}
+user_cities = {}                       # {user_id: [{"name": str, "lat": float, "lon": float}, ...]}
+user_statuses = {}                     # {user_id: "active"/"banned"/"muted"}
+user_nicknames = {}                    # {user_id: str}
+all_user_ids = set()                   # все известные ID
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TOKEN)
@@ -40,165 +45,7 @@ class Broadcast(StatesGroup):
 class SetNickname(StatesGroup):
     waiting_for_nick = State()
 
-# ---------- БАЗА ДАННЫХ (Turso) ----------
-def get_db():
-    return libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
-
-async def init_db():
-    def _():
-        db = get_db()
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                reg_date TEXT,
-                status TEXT DEFAULT 'active'
-            )
-        """)
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS locations (
-                user_id INTEGER PRIMARY KEY,
-                lat REAL,
-                lon REAL
-            )
-        """)
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS cities (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                name TEXT,
-                lat REAL,
-                lon REAL,
-                UNIQUE(user_id, name)
-            )
-        """)
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS chat_state (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                enabled INTEGER DEFAULT 0
-            )
-        """)
-        db.execute("INSERT OR IGNORE INTO chat_state (id, enabled) VALUES (1, 0)")
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS profiles (
-                user_id INTEGER PRIMARY KEY,
-                nickname TEXT
-            )
-        """)
-        db.commit()
-    await asyncio.get_event_loop().run_in_executor(None, _)
-
-async def create_user(user_id: int, username: str = None):
-    def _():
-        db = get_db()
-        db.execute(
-            "INSERT OR IGNORE INTO users (user_id, username, reg_date) VALUES (?, ?, ?)",
-            (user_id, username, datetime.now(MOSCOW_TZ).isoformat())
-        )
-        db.commit()
-    await asyncio.get_event_loop().run_in_executor(None, _)
-
-async def get_user_status(user_id: int) -> str:
-    def _():
-        db = get_db()
-        r = db.execute("SELECT status FROM users WHERE user_id = ?", (user_id,)).fetchone()
-        return r[0] if r else "active"
-    return await asyncio.get_event_loop().run_in_executor(None, _)
-
-async def set_user_status(user_id: int, status: str):
-    def _():
-        db = get_db()
-        db.execute("UPDATE users SET status = ? WHERE user_id = ?", (status, user_id))
-        db.commit()
-    await asyncio.get_event_loop().run_in_executor(None, _)
-
-async def save_location(user_id: int, lat: float, lon: float):
-    def _():
-        db = get_db()
-        db.execute(
-            "INSERT OR REPLACE INTO locations (user_id, lat, lon) VALUES (?, ?, ?)",
-            (user_id, lat, lon)
-        )
-        db.commit()
-    await asyncio.get_event_loop().run_in_executor(None, _)
-
-async def get_location(user_id: int):
-    def _():
-        db = get_db()
-        r = db.execute("SELECT lat, lon FROM locations WHERE user_id = ?", (user_id,)).fetchone()
-        return (r[0], r[1]) if r else None
-    return await asyncio.get_event_loop().run_in_executor(None, _)
-
-async def add_city_db(user_id: int, name: str, lat: float, lon: float) -> bool:
-    def _():
-        try:
-            db = get_db()
-            db.execute(
-                "INSERT INTO cities (user_id, name, lat, lon) VALUES (?, ?, ?, ?)",
-                (user_id, name, lat, lon)
-            )
-            db.commit()
-            return True
-        except:
-            return False
-    return await asyncio.get_event_loop().run_in_executor(None, _)
-
-async def get_cities(user_id: int) -> list:
-    def _():
-        db = get_db()
-        rows = db.execute("SELECT name, lat, lon FROM cities WHERE user_id = ?", (user_id,)).fetchall()
-        return [{"name": r[0], "lat": r[1], "lon": r[2]} for r in rows]
-    return await asyncio.get_event_loop().run_in_executor(None, _)
-
-async def city_exists(user_id: int, name: str) -> bool:
-    def _():
-        db = get_db()
-        r = db.execute(
-            "SELECT 1 FROM cities WHERE user_id = ? AND LOWER(name) = LOWER(?)",
-            (user_id, name)
-        ).fetchone()
-        return r is not None
-    return await asyncio.get_event_loop().run_in_executor(None, _)
-
-async def get_chat_state() -> bool:
-    def _():
-        db = get_db()
-        r = db.execute("SELECT enabled FROM chat_state WHERE id = 1").fetchone()
-        return bool(r[0]) if r else False
-    return await asyncio.get_event_loop().run_in_executor(None, _)
-
-async def set_chat_state(enabled: bool):
-    def _():
-        db = get_db()
-        db.execute("UPDATE chat_state SET enabled = ? WHERE id = 1", (int(enabled),))
-        db.commit()
-    await asyncio.get_event_loop().run_in_executor(None, _)
-
-async def get_all_user_ids() -> list:
-    def _():
-        db = get_db()
-        rows = db.execute("SELECT user_id FROM users").fetchall()
-        return [r[0] for r in rows]
-    return await asyncio.get_event_loop().run_in_executor(None, _)
-
-async def set_nickname(user_id: int, nick: str):
-    def _():
-        db = get_db()
-        db.execute(
-            "INSERT OR REPLACE INTO profiles (user_id, nickname) VALUES (?, ?)",
-            (user_id, nick)
-        )
-        db.commit()
-    await asyncio.get_event_loop().run_in_executor(None, _)
-
-async def get_nickname(user_id: int) -> str | None:
-    def _():
-        db = get_db()
-        r = db.execute("SELECT nickname FROM profiles WHERE user_id = ?", (user_id,)).fetchone()
-        return r[0] if r else None
-    return await asyncio.get_event_loop().run_in_executor(None, _)
-
-# ---------- ПОГОДНЫЕ КОДЫ (только русские) ----------
+# ---------- ПОГОДНЫЕ КОДЫ ----------
 WEATHER_CODES = {
     0: "Ясно", 1: "Преимущественно ясно", 2: "Переменная облачность",
     3: "Пасмурно", 45: "Туман", 48: "Иней", 51: "Морось",
@@ -208,7 +55,7 @@ WEATHER_CODES = {
     95: "Гроза", 96: "Гроза с градом", 99: "Гроза с градом"
 }
 
-# ---------- РУССКИЕ ТЕКСТЫ ----------
+# ---------- ТЕКСТЫ ----------
 TEXT = {
     "welcome_back": "🌈 <b>С возвращением!</b> Выберите действие:",
     "welcome_new": "🌈 <b>Привет!</b> Отправьте геолокацию, чтобы открыть все функции.",
@@ -261,7 +108,7 @@ def get_text(key, **kwargs):
 
 async def check_status(message: types.Message):
     user_id = message.from_user.id
-    status = await get_user_status(user_id)
+    status = user_statuses.get(user_id, "active")
     if status == "banned":
         await message.answer(get_text("banned_msg"))
         return False
@@ -271,7 +118,7 @@ async def check_status(message: types.Message):
     return True
 
 async def get_display_name(user_id: int) -> str:
-    nick = await get_nickname(user_id)
+    nick = user_nicknames.get(user_id)
     if nick:
         return nick
     try:
@@ -295,7 +142,6 @@ async def get_main_kb(user: types.User = None):
         [KeyboardButton(text="📍 Обновить геолокацию", request_location=True)],
         [KeyboardButton(text="👤 Профиль")]
     ]
-    chat_enabled = await get_chat_state()
     if chat_enabled:
         buttons.append([KeyboardButton(text="💬 Чат")])
     if user and is_admin(user):
@@ -303,7 +149,7 @@ async def get_main_kb(user: types.User = None):
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
 async def get_cities_kb(user_id):
-    cities = await get_cities(user_id)
+    cities = user_cities.get(user_id, [])
     buttons = []
     for city in cities:
         buttons.append([KeyboardButton(text=f"🏙 {city['name']}")])
@@ -434,13 +280,16 @@ async def get_ton_price():
     except: pass
     return None
 
+# ---------- ГЛОБАЛЬНОЕ СОСТОЯНИЕ ЧАТА ----------
+chat_enabled = False
+
 # ---------- ОБРАБОТЧИКИ ----------
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
-    await create_user(user_id, message.from_user.username)
-    loc = await get_location(user_id)
+    all_user_ids.add(user_id)
+    loc = user_locations.get(user_id)
     if loc:
         await message.answer(get_text("welcome_back"), reply_markup=await get_main_kb(message.from_user), parse_mode="HTML")
     else:
@@ -451,8 +300,8 @@ async def location_received(message: types.Message, state: FSMContext):
     if not await check_status(message): return
     await state.clear()
     user_id = message.from_user.id
-    await create_user(user_id, message.from_user.username)
-    await save_location(user_id, message.location.latitude, message.location.longitude)
+    all_user_ids.add(user_id)
+    user_locations[user_id] = (message.location.latitude, message.location.longitude)
     await message.answer(get_text("location_saved"), reply_markup=await get_main_kb(message.from_user))
 
 # Профиль
@@ -461,7 +310,7 @@ async def profile_menu(message: types.Message, state: FSMContext):
     if not await check_status(message): return
     await state.clear()
     user_id = message.from_user.id
-    nick = await get_nickname(user_id) or get_text("nick_not_set")
+    nick = user_nicknames.get(user_id, get_text("nick_not_set"))
     text = get_text("profile_menu", nick=nick)
     await message.answer(text, reply_markup=get_profile_kb(), parse_mode="HTML")
 
@@ -479,7 +328,7 @@ async def set_nick_finish(message: types.Message, state: FSMContext):
         await message.answer("❌ Некорректный ник. Используйте буквы/цифры, до 20 символов.")
         return
     user_id = message.from_user.id
-    await set_nickname(user_id, nick)
+    user_nicknames[user_id] = nick
     await state.clear()
     await message.answer(get_text("nick_saved", nick=nick), reply_markup=get_profile_kb())
 
@@ -516,12 +365,14 @@ async def add_city_name(message: types.Message, state: FSMContext):
         await msg.edit_text(get_text("city_not_found", city=city_name))
         return
     lat, lon = coords
-    if await city_exists(user_id, city_name):
+    if user_id not in user_cities:
+        user_cities[user_id] = []
+    if any(c['name'].lower() == city_name.lower() for c in user_cities[user_id]):
         await msg.edit_text(get_text("city_already_exists", city=city_name))
         await state.clear()
         await weather_menu(message, state)
         return
-    await add_city_db(user_id, city_name, lat, lon)
+    user_cities[user_id].append({"name": city_name, "lat": lat, "lon": lon})
     await state.clear()
     await msg.edit_text(get_text("city_added", city=city_name))
     await weather_menu(message, state)
@@ -532,7 +383,7 @@ async def show_city_weather(message: types.Message, state: FSMContext):
     await state.clear()
     city_name = message.text[2:].strip()
     user_id = message.from_user.id
-    cities = await get_cities(user_id)
+    cities = user_cities.get(user_id, [])
     city = next((c for c in cities if c['name'] == city_name), None)
     if not city:
         await message.answer("Город не найден")
@@ -634,7 +485,7 @@ async def admin_menu(message: types.Message, state: FSMContext):
 @dp.message(lambda msg: msg.text == "👥 Пользователи")
 async def admin_users_list(message: types.Message):
     if not is_admin(message.from_user): return
-    user_ids = await get_all_user_ids()
+    user_ids = list(all_user_ids)
     if not user_ids:
         await message.answer("Нет пользователей")
         return
@@ -654,7 +505,7 @@ async def admin_users_list(message: types.Message):
 async def user_actions_menu(call: CallbackQuery):
     if not is_admin(call.from_user): return
     target_id = int(call.data.split("_")[1])
-    status = await get_user_status(target_id)
+    status = user_statuses.get(target_id, "active")
     kb = InlineKeyboardMarkup(inline_keyboard=[])
     if status != "banned":
         kb.inline_keyboard.append([InlineKeyboardButton(text="Забанить", callback_data=f"ban_{target_id}")])
@@ -667,7 +518,7 @@ async def user_actions_menu(call: CallbackQuery):
 async def ban_user(call: CallbackQuery):
     if not is_admin(call.from_user): return
     target_id = int(call.data.split("_")[1])
-    await set_user_status(target_id, "banned")
+    user_statuses[target_id] = "banned"
     await call.answer(f"Пользователь {target_id} забанен")
     await admin_users_list(call.message)
 
@@ -675,7 +526,7 @@ async def ban_user(call: CallbackQuery):
 async def mute_user(call: CallbackQuery):
     if not is_admin(call.from_user): return
     target_id = int(call.data.split("_")[1])
-    await set_user_status(target_id, "muted")
+    user_statuses[target_id] = "muted"
     await call.answer(f"Пользователь {target_id} замучен")
     await admin_users_list(call.message)
 
@@ -686,12 +537,7 @@ async def back_to_users(call: CallbackQuery):
 @dp.message(lambda msg: msg.text == "📋 Белый лист")
 async def whitelist_menu(message: types.Message):
     if not is_admin(message.from_user): return
-    user_ids = await get_all_user_ids()
-    blocked = []
-    for uid in user_ids:
-        status = await get_user_status(uid)
-        if status != "active":
-            blocked.append((uid, status))
+    blocked = [(uid, st) for uid, st in user_statuses.items() if st != "active"]
     if not blocked:
         await message.answer(get_text("whitelist_empty"))
         return
@@ -714,7 +560,7 @@ async def whitelist_menu(message: types.Message):
 async def unban_user(call: CallbackQuery):
     if not is_admin(call.from_user): return
     target_id = int(call.data.split("_")[1])
-    await set_user_status(target_id, "active")
+    user_statuses[target_id] = "active"
     await call.answer(f"Пользователь {target_id} разбанен")
     await whitelist_menu(call.message)
 
@@ -722,7 +568,7 @@ async def unban_user(call: CallbackQuery):
 async def unmute_user(call: CallbackQuery):
     if not is_admin(call.from_user): return
     target_id = int(call.data.split("_")[1])
-    await set_user_status(target_id, "active")
+    user_statuses[target_id] = "active"
     await call.answer(f"Пользователь {target_id} размучен")
     await whitelist_menu(call.message)
 
@@ -742,8 +588,7 @@ async def broadcast_send(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user): return
     await state.clear()
     sent = 0
-    user_ids = await get_all_user_ids()
-    for uid in user_ids:
+    for uid in list(all_user_ids):
         try:
             await bot.send_message(uid, message.text)
             sent += 1
@@ -755,7 +600,7 @@ async def broadcast_send(message: types.Message, state: FSMContext):
 @dp.message(lambda msg: msg.text == "💬 Управление чатом")
 async def admin_chat_manage(message: types.Message):
     if not is_admin(message.from_user): return
-    chat_enabled = await get_chat_state()
+    global chat_enabled
     count = len(chat_users)
     status = "включён" if chat_enabled else "выключен"
     text = f"💬 <b>Управление чатом</b>\nУчастников: {count}\nСтатус: {status}"
@@ -771,15 +616,15 @@ async def admin_chat_manage(message: types.Message):
 @dp.callback_query(F.data == "toggle_chat")
 async def toggle_chat_global(call: CallbackQuery):
     if not is_admin(call.from_user): return
-    chat_enabled = await get_chat_state()
-    await set_chat_state(not chat_enabled)
-    if chat_enabled:
+    global chat_enabled
+    chat_enabled = not chat_enabled
+    if not chat_enabled:
         for uid in chat_users.copy():
             try:
                 await bot.send_message(uid, "💬 Чат временно отключён.")
             except: pass
         chat_users.clear()
-    await call.message.edit_text("✅ Общий чат включён." if not chat_enabled else "🛑 Общий чат выключен.")
+    await call.message.edit_text("✅ Общий чат включён." if chat_enabled else "🛑 Общий чат выключен.")
     await call.answer()
 
 @dp.callback_query(F.data == "admin_back")
@@ -791,11 +636,10 @@ async def admin_back(call: CallbackQuery):
 @dp.message(lambda msg: msg.text == "💬 Чат")
 async def toggle_chat(message: types.Message):
     if not await check_status(message): return
-    user_id = message.from_user.id
-    chat_enabled = await get_chat_state()
     if not chat_enabled:
         await message.answer(get_text("chat_off"))
         return
+    user_id = message.from_user.id
     if user_id in chat_users:
         chat_users.discard(user_id)
         await message.answer(get_text("chat_leave"))
@@ -817,7 +661,7 @@ async def toggle_chat(message: types.Message):
 async def chat_message_handler(message: types.Message):
     if not await check_status(message): return
     user_id = message.from_user.id
-    if user_id not in chat_users or not await get_chat_state():
+    if user_id not in chat_users or not chat_enabled:
         return
     name = await get_display_name(user_id)
     for uid in chat_users.copy():
@@ -831,7 +675,7 @@ async def chat_message_handler(message: types.Message):
 async def back_to_main(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = message.from_user.id
-    loc = await get_location(user_id)
+    loc = user_locations.get(user_id)
     if loc:
         await message.answer(get_text("welcome_back"), reply_markup=await get_main_kb(message.from_user), parse_mode="HTML")
     else:
@@ -842,7 +686,6 @@ async def handle(request):
     return web.Response(text="Bot is running")
 
 async def main():
-    await init_db()
     app = web.Application()
     app.router.add_get('/', handle)
     runner = web.AppRunner(app)
