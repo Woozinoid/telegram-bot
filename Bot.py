@@ -25,15 +25,7 @@ from aiogram.types import (
 # ================= НАСТРОЙКИ =================
 
 
-TOKEN = os.getenv(
-    "8641527466:AAGSkaTzMJm5X6ExY3vVYRiMLxkwSxOOpnU"
-)
-
-
-if not TOKEN:
-    raise ValueError(
-        "BOT_TOKEN не найден"
-    )
+TOKEN = "8641527466:AAGSkaTzMJm5X6ExY3vVYRiMLxkwSxOOpnU"
 
 
 
