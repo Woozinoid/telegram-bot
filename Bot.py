@@ -1,700 +1,2649 @@
 import asyncio
-import json
 import logging
-import random
 import os
+import time
+
 from datetime import datetime, timezone, timedelta
+
+import aiohttp
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.storage.memory import MemoryStorage
+
 from aiogram.types import (
-    ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton
 )
-import aiohttp
-from aiohttp import web
 
-# ---------- НАСТРОЙКИ ----------
-TOKEN = "8641527466:AAGSkaTzMJm5X6ExY3vVYRiMLxkwSxOOpnU"
-MOSCOW_TZ = timezone(timedelta(hours=3))
 
-ADMIN_USERNAMES = ["Woozinoid", "HwangMinw"]
-chat_users = set()                     # кто сейчас в чате
+# ================= НАСТРОЙКИ =================
 
-# Хранилища в памяти
-user_locations = {}                    # {user_id: (lat, lon)}
-user_cities = {}                       # {user_id: [{"name": str, "lat": float, "lon": float}, ...]}
-user_statuses = {}                     # {user_id: "active"/"banned"/"muted"}
-user_nicknames = {}                    # {user_id: str}
-all_user_ids = set()                   # все известные ID
 
-logging.basicConfig(level=logging.INFO)
-bot = Bot(token=TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
+TOKEN = os.getenv(
+    "8641527466:AAGSkaTzMJm5X6ExY3vVYRiMLxkwSxOOpnU"
+)
 
-class AddCity(StatesGroup):
-    waiting_for_name = State()
 
-class Broadcast(StatesGroup):
-    waiting_for_message = State()
-
-class SetNickname(StatesGroup):
-    waiting_for_nick = State()
-
-# ---------- ПОГОДНЫЕ КОДЫ ----------
-WEATHER_CODES = {
-    0: "Ясно", 1: "Преимущественно ясно", 2: "Переменная облачность",
-    3: "Пасмурно", 45: "Туман", 48: "Иней", 51: "Морось",
-    53: "Морось", 55: "Сильная морось", 61: "Дождь",
-    63: "Сильный дождь", 65: "Ливень", 71: "Снег",
-    73: "Снегопад", 75: "Сильный снег", 80: "Кратковременный дождь",
-    95: "Гроза", 96: "Гроза с градом", 99: "Гроза с градом"
-}
-
-# ---------- ТЕКСТЫ ----------
-TEXT = {
-    "welcome_back": "🌈 <b>С возвращением!</b> Выберите действие:",
-    "welcome_new": "🌈 <b>Привет!</b> Отправьте геолокацию, чтобы открыть все функции.",
-    "location_saved": "✅ Геолокация сохранена!",
-    "weather_menu": "🌟 Выберите город или добавьте новый:",
-    "add_city_prompt": "🏙 Введите название города:",
-    "cancel": "↩ Назад",
-    "searching_coords": "⏳ Ищу координаты...",
-    "city_not_found": "❌ Не удалось найти город «{city}».",
-    "city_already_exists": "❗ Город «{city}» уже в списке.",
-    "city_added": "✅ Город «{city}» добавлен!",
-    "loading_weather": "⏳ Загружаю погоду для «{city}»...",
-    "weather_error": "❌ Ошибка: {error}",
-    "currency_menu": "💰 Выберите валютную пару:",
-    "loading_currency": "⏳ Загружаю данные по {pair}...",
-    "banned_msg": "⛔ Вы забанены. Обратитесь к администратору.",
-    "muted_msg": "🔇 Вы временно не можете писать.",
-    "chat_enter": "💬 Вы вошли в общий чат.",
-    "chat_leave": "💬 Вы вышли из чата.",
-    "chat_off": "💬 Чат временно отключён.",
-    "chat_global_on": "✅ Общий чат включён.",
-    "chat_global_off": "🛑 Общий чат выключен.",
-    "whitelist_empty": "📋 Список заблокированных пуст.",
-    "broadcast_sent": "✅ Сообщение отправлено {count} пользователям.",
-    "admin_menu": "🔧 <b>Админ-панель</b>",
-    "main_menu": [["🌟 Погода", "💰 Курсы валют"], ["📍 Обновить геолокацию"], ["👤 Профиль"]],
-    "weather_frame": "🌍 {city}\n🌤 {desc}\n🌡 Температура: {temp}°C (ощ. {feels}°C)\n☁️ Облачность: {cloudcover}%\n💧 Влажность: {humidity}%\n🔵 Давление: {pressure} мм рт.ст.\n🌅 Восход: {sunrise}\n🌇 Закат: {sunset}",
-    "now_in_city": "🌈 Сейчас в {city}: {desc}",
-    "fiat_info": "📅 <b>{date}</b> 🕒 {time} (МСК)\n\n<b>{pair}</b>\n💰 Текущий курс: <b>{current:.2f} ₽</b>\n📉 За 24 часа: {arrow_24} {change_24:+.2f} ₽ ({change_24_pct:+.2f}%)\n{week_info}",
-    "ton_info": "📅 <b>{date}</b> 🕒 {time} (МСК)\n\n<b>💎 TON/RUB</b>\n💰 Текущий курс: <b>{ton_rub:.2f} ₽</b> (${ton_usd:.4f})\n📉 За 24 часа: {arrow} {change_pct:+.2f}%",
-    "profile_menu": "👤 <b>Профиль</b>\nВаш ник: {nick}\nВыберите действие:",
-    "set_nick_prompt": "✏️ Введите новый никнейм (только буквы, цифры, без пробелов):",
-    "nick_saved": "✅ Никнейм сохранён: {nick}",
-    "nick_not_set": "не задан",
-    "chat_joined": "💬 Пользователь {name} присоединился к чату."
-}
-
-MONTHS_RU = ["", "января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"]
-WEEKDAYS_RU = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
-
-# ---------- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ----------
-def is_admin(user: types.User) -> bool:
-    return user.username is not None and user.username.lower() in [u.lower() for u in ADMIN_USERNAMES]
-
-def get_text(key, **kwargs):
-    text = TEXT[key]
-    if kwargs:
-        text = text.format(**kwargs)
-    return text
-
-async def check_status(message: types.Message):
-    user_id = message.from_user.id
-    status = user_statuses.get(user_id, "active")
-    if status == "banned":
-        await message.answer(get_text("banned_msg"))
-        return False
-    elif status == "muted":
-        await message.answer(get_text("muted_msg"))
-        return False
-    return True
-
-async def get_display_name(user_id: int) -> str:
-    nick = user_nicknames.get(user_id)
-    if nick:
-        return nick
-    try:
-        user = await bot.get_chat(user_id)
-        if user.username:
-            return f"@{user.username}"
-        return user.first_name or f"id{user_id}"
-    except:
-        return f"id{user_id}"
-
-# ---------- КЛАВИАТУРЫ ----------
-def get_location_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📍 Отправить геолокацию", request_location=True)]],
-        resize_keyboard=True
+if not TOKEN:
+    raise ValueError(
+        "BOT_TOKEN не найден"
     )
 
-async def get_main_kb(user: types.User = None):
-    buttons = [
-        [KeyboardButton(text="🌟 Погода"), KeyboardButton(text="💰 Курсы валют")],
-        [KeyboardButton(text="📍 Обновить геолокацию", request_location=True)],
-        [KeyboardButton(text="👤 Профиль")]
-    ]
-    if chat_enabled:
-        buttons.append([KeyboardButton(text="💬 Чат")])
-    if user and is_admin(user):
-        buttons.append([KeyboardButton(text="🔧 Админ")])
-    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
-async def get_cities_kb(user_id):
-    cities = user_cities.get(user_id, [])
-    buttons = []
-    for city in cities:
-        buttons.append([KeyboardButton(text=f"🏙 {city['name']}")])
-    buttons.append([KeyboardButton(text="➕ Добавить город")])
-    buttons.append([KeyboardButton(text="↩ Назад")])
-    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
-def get_cancel_kb():
-    return ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="↩ Назад")]], resize_keyboard=True)
+ADMIN_USERNAMES = [
+    "Woozinoid",
+    "HwangMinw"
+]
 
-def get_currency_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🇺🇸 USD/RUB"), KeyboardButton(text="🇪🇺 EUR/RUB")],
-            [KeyboardButton(text="💎 TON/RUB")],
-            [KeyboardButton(text="↩ Назад")]
-        ],
-        resize_keyboard=True
-    )
 
-def get_profile_kb():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="✏️ Изменить ник")],
-            [KeyboardButton(text="↩ Назад")]
-        ],
-        resize_keyboard=True
-    )
+MOSCOW_TZ = timezone(
+    timedelta(hours=3)
+)
 
-# ---------- API ФУНКЦИИ ----------
-async def geocode_city(city_name: str) -> tuple:
-    url = "https://nominatim.openstreetmap.org/search"
-    params = {"q": city_name, "format": "json", "limit": 1, "accept-language": "ru"}
-    headers = {"User-Agent": "MyTelegramBot/1.0"}
-    timeout = aiohttp.ClientTimeout(total=10)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, params=params, headers=headers) as resp:
-                data = await resp.json()
-                if data:
-                    return float(data[0]["lat"]), float(data[0]["lon"])
-    except Exception as e:
-        logging.error(f"Geocode error: {e}")
-    return None
 
-async def get_weather_by_coords(lat: float, lon: float, display_name: str):
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": lat, "longitude": lon,
-        "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,cloud_cover,pressure_msl",
-        "daily": "sunrise,sunset",
-        "timezone": "auto",
-        "forecast_days": 1
-    }
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, params=params) as resp:
-            data = await resp.json()
-    if "error" in data and data["error"]:
-        raise Exception("Ошибка получения погоды")
-    curr = data["current"]
-    daily = data["daily"]
-    tz_offset = data.get("utc_offset_seconds", 0)
-    local_tz = timezone(timedelta(seconds=tz_offset))
-    now_local = datetime.now(local_tz)
 
-    desc = WEATHER_CODES.get(curr["weather_code"], "Неизвестно")
-    month_str = MONTHS_RU[now_local.month]
-    weekday_str = WEEKDAYS_RU[now_local.weekday()]
-    local_time_str = f"{now_local.day} {month_str} {now_local.year}, {weekday_str} {now_local.strftime('%H:%M:%S')}"
+logging.basicConfig(
+    level=logging.INFO,
+    format=
+    "%(asctime)s | %(levelname)s | %(message)s"
+)
 
-    sunrise_utc = datetime.fromisoformat(daily["sunrise"][0]).replace(tzinfo=timezone.utc).astimezone(local_tz)
-    sunset_utc = datetime.fromisoformat(daily["sunset"][0]).replace(tzinfo=timezone.utc).astimezone(local_tz)
 
-    return {
-        "city": display_name,
-        "country": "",
-        "temp": curr["temperature_2m"],
-        "feels": curr["apparent_temperature"],
-        "desc": desc,
-        "humidity": curr["relative_humidity_2m"],
-        "pressure": round(curr["pressure_msl"] * 0.75006, 1),
-        "cloudcover": curr["cloud_cover"],
-        "visibility": "—",
-        "uv_index": "—",
-        "sunrise": sunrise_utc.strftime("%H:%M"),
-        "sunset": sunset_utc.strftime("%H:%M"),
-        "local_time": local_time_str
-    }
 
-async def get_cbr_currency():
-    url = "https://www.cbr-xml-daily.ru/daily_json.js"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            return json.loads(await resp.text())
+bot = Bot(
+    token=TOKEN
+)
 
-async def get_cbr_historical(date_str: str):
-    url = f"https://www.cbr-xml-daily.ru/archive/{date_str}/daily_json.js"
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
-            if resp.status == 200:
-                return json.loads(await resp.text())
-            else:
-                raise Exception("No data")
 
-async def get_ton_price():
-    try:
-        url = "https://api.coingecko.com/api/v3/simple/price"
-        params = {"ids": "the-open-network", "vs_currencies": "usd", "include_24hr_change": "true"}
-        timeout = aiohttp.ClientTimeout(total=8)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, params=params) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    ton = data.get("the-open-network", {})
-                    if ton.get("usd"):
-                        return {"usd": ton["usd"], "change_24h_pct": ton.get("usd_24h_change", 0)}
-    except: pass
-    try:
-        url = "https://api.coincap.io/v2/assets/the-open-network"
-        timeout = aiohttp.ClientTimeout(total=8)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    asset = data.get("data", {})
-                    if asset.get("priceUsd"):
-                        return {"usd": float(asset["priceUsd"]), "change_24h_pct": float(asset.get("changePercent24Hr", 0))}
-    except: pass
-    return None
+dp = Dispatcher(
+    storage=MemoryStorage()
+)
 
-# ---------- ГЛОБАЛЬНОЕ СОСТОЯНИЕ ЧАТА ----------
+
+
+# ================= ПАМЯТЬ =================
+
+
+# пользователи
+
+all_user_ids = set()
+
+
+# города
+
+user_locations = {}
+
+user_cities = {}
+
+
+
+# профили
+
+user_nicknames = {}
+
+user_statuses = {}
+
+
+
+# чат
+
+chat_users = set()
+
 chat_enabled = False
 
-# ---------- ОБРАБОТЧИКИ ----------
+
+
+# статистика
+
+user_activity = {}
+
+message_count = 0
+
+
+
+# антиспам
+
+spam_data = {}
+
+SPAM_DELAY = 2
+
+
+
+# логи
+
+admin_logs = []
+
+
+
+# новости
+
+news_subscribers = {}
+
+favorite_news = {}
+
+
+
+# кэш
+
+weather_cache = {}
+
+currency_cache = {}
+
+
+
+CACHE_TIME = 300
+
+
+
+
+# ================= FSM =================
+
+
+class AddCity(StatesGroup):
+
+    waiting_name = State()
+
+
+
+class SetNickname(StatesGroup):
+
+    waiting_nick = State()
+
+
+
+class Broadcast(StatesGroup):
+
+    waiting_message = State()
+
+
+
+class NewsSearch(StatesGroup):
+
+    waiting_text = State()
+
+
+
+
+# ================= ВСПОМОГАТЕЛЬНОЕ =================
+
+
+def is_admin(user):
+
+    if not user.username:
+        return False
+
+
+    return (
+        user.username.lower()
+        in
+        [
+            x.lower()
+            for x in ADMIN_USERNAMES
+        ]
+    )
+
+
+
+
+def log_action(text):
+
+    admin_logs.append(
+        {
+            "time":
+            datetime.now()
+            .strftime(
+                "%d.%m.%Y %H:%M:%S"
+            ),
+
+            "text": text
+        }
+    )
+
+
+    if len(admin_logs) > 300:
+
+        admin_logs.pop(0)
+
+
+
+
+def update_activity(uid):
+
+    global message_count
+
+
+    message_count += 1
+
+
+    user_activity[uid] = (
+        user_activity.get(
+            uid,
+            0
+        )
+        +
+        1
+    )
+
+
+
+
+def anti_spam(uid):
+
+    now = time.time()
+
+
+    last = spam_data.get(
+        uid,
+        0
+    )
+
+
+    if now - last < SPAM_DELAY:
+
+        return False
+
+
+
+    spam_data[uid] = now
+
+
+    return True
+
+
+
+
+async def check_user(message):
+
+    uid = message.from_user.id
+
+
+    status = user_statuses.get(
+        uid,
+        "active"
+    )
+
+
+
+    if status == "banned":
+
+        await message.answer(
+            "⛔ Вы заблокированы."
+        )
+
+        return False
+
+
+
+    if status == "muted":
+
+        await message.answer(
+            "🔇 Вам запрещено писать."
+        )
+
+        return False
+
+
+
+
+    if not anti_spam(uid):
+
+        await message.answer(
+            "⏳ Слишком быстро."
+        )
+
+        return False
+
+
+
+
+    all_user_ids.add(uid)
+
+    update_activity(uid)
+
+
+    return True
+
+
+
+
+async def display_name(uid):
+
+    if uid in user_nicknames:
+
+        return user_nicknames[uid]
+
+
+
+    try:
+
+        user = await bot.get_chat(uid)
+
+
+        if user.username:
+
+            return (
+                "@"
+                +
+                user.username
+            )
+
+
+        return (
+            user.first_name
+            or
+            str(uid)
+        )
+
+
+    except:
+
+        return str(uid)
+
+
+
+
+
+# ================= КЛАВИАТУРЫ =================
+
+
+
+async def main_keyboard(user=None):
+
+
+    buttons = [
+
+        [
+            KeyboardButton(
+                text="🌟 Погода"
+            ),
+
+            KeyboardButton(
+                text="💰 Курсы валют"
+            )
+
+        ],
+
+
+        [
+
+            KeyboardButton(
+                text="📰 Новости"
+            )
+
+        ],
+
+
+        [
+
+            KeyboardButton(
+                text="📍 Обновить геолокацию",
+                request_location=True
+            )
+
+        ],
+
+
+        [
+
+            KeyboardButton(
+                text="👤 Профиль"
+            )
+
+        ]
+
+    ]
+
+
+
+    if chat_enabled:
+
+        buttons.append(
+            [
+                KeyboardButton(
+                    text="💬 Чат"
+                )
+            ]
+        )
+
+
+
+    if user and is_admin(user):
+
+        buttons.append(
+            [
+                KeyboardButton(
+                    text="🔧 Админ"
+                )
+            ]
+        )
+
+
+
+    return ReplyKeyboardMarkup(
+        keyboard=buttons,
+        resize_keyboard=True
+    )
+
+
+
+
+
+def back_keyboard():
+
+    return ReplyKeyboardMarkup(
+
+        keyboard=[
+
+            [
+
+                KeyboardButton(
+                    text="↩ Назад"
+                )
+
+            ]
+
+        ],
+
+        resize_keyboard=True
+
+    )
+    # ================= ПОГОДА =================
+
+
+WEATHER_CODES = {
+
+    0: "☀️ Ясно",
+    1: "🌤 Преимущественно ясно",
+    2: "⛅ Облачно",
+    3: "☁️ Пасмурно",
+    45: "🌫 Туман",
+    61: "🌧 Дождь",
+    63: "🌧 Сильный дождь",
+    71: "❄️ Снег",
+    80: "🌦 Ливень",
+    95: "⛈ Гроза"
+
+}
+
+
+
+
+async def geocode_city(name):
+
+    url = (
+        "https://nominatim.openstreetmap.org/search"
+    )
+
+
+    params = {
+
+        "q": name,
+        "format": "json",
+        "limit": 1,
+        "accept-language": "ru"
+
+    }
+
+
+    headers = {
+
+        "User-Agent":
+        "NovostiWooziBot"
+
+    }
+
+
+    try:
+
+        async with aiohttp.ClientSession() as session:
+
+            async with session.get(
+                url,
+                params=params,
+                headers=headers
+            ) as response:
+
+
+                data = await response.json()
+
+
+
+                if data:
+
+                    return (
+
+                        float(data[0]["lat"]),
+
+                        float(data[0]["lon"])
+
+                    )
+
+
+    except Exception as e:
+
+        logging.error(
+            f"Geocode error {e}"
+        )
+
+
+    return None
+
+
+
+
+
+async def get_weather(lat, lon, city):
+
+
+    key = f"{lat}:{lon}"
+
+
+    if key in weather_cache:
+
+
+        saved, result = weather_cache[key]
+
+
+        if time.time() - saved < CACHE_TIME:
+
+            return result
+
+
+
+
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+    )
+
+
+
+    params = {
+
+        "latitude": lat,
+
+        "longitude": lon,
+
+        "current":
+        "temperature_2m,"
+        "apparent_temperature,"
+        "relative_humidity_2m,"
+        "weather_code,"
+        "cloud_cover,"
+        "pressure_msl",
+
+        "timezone":
+        "auto"
+
+    }
+
+
+
+
+    async with aiohttp.ClientSession() as session:
+
+
+        async with session.get(
+            url,
+            params=params
+        ) as response:
+
+
+            data = await response.json()
+
+
+
+    current = data["current"]
+
+
+
+    result = {
+
+        "city": city,
+
+        "temp":
+        current["temperature_2m"],
+
+        "feels":
+        current["apparent_temperature"],
+
+        "humidity":
+        current["relative_humidity_2m"],
+
+        "cloud":
+        current["cloud_cover"],
+
+        "pressure":
+        round(
+            current["pressure_msl"]
+            *
+            0.75006,
+            1
+        ),
+
+        "desc":
+        WEATHER_CODES.get(
+            current["weather_code"],
+            "Неизвестно"
+        )
+
+    }
+
+
+
+    weather_cache[key] = (
+        time.time(),
+        result
+    )
+
+
+
+    return result
+
+
+
+
+
+# ================= ВАЛЮТА =================
+
+
+
+async def get_currency():
+
+
+    if "currency" in currency_cache:
+
+
+        saved, data = currency_cache["currency"]
+
+
+        if time.time() - saved < 300:
+
+            return data
+
+
+
+
+
+    url = (
+        "https://www.cbr-xml-daily.ru/daily_json.js"
+    )
+
+
+
+    async with aiohttp.ClientSession() as session:
+
+
+        async with session.get(url) as response:
+
+
+            data = await response.json()
+
+
+
+    currency_cache["currency"] = (
+
+        time.time(),
+
+        data
+
+    )
+
+
+    return data
+
+
+
+
+
+
+
+# ================= START =================
+
+
+
 @dp.message(Command("start"))
-async def start_cmd(message: types.Message, state: FSMContext):
+async def start(
+        message: types.Message,
+        state: FSMContext):
+
+
     await state.clear()
-    user_id = message.from_user.id
-    all_user_ids.add(user_id)
-    loc = user_locations.get(user_id)
-    if loc:
-        await message.answer(get_text("welcome_back"), reply_markup=await get_main_kb(message.from_user), parse_mode="HTML")
-    else:
-        await message.answer(get_text("welcome_new"), reply_markup=get_location_kb(), parse_mode="HTML")
+
+
+
+    uid = message.from_user.id
+
+
+    all_user_ids.add(uid)
+
+
+
+    await message.answer(
+
+        "🌈 Добро пожаловать в "
+        "Новости · Вузи!\n\n"
+        "Выберите действие:",
+
+        reply_markup=
+        await main_keyboard(
+            message.from_user
+        )
+
+    )
+
+
+
+
+
+
+
+# ================= ГЕОЛОКАЦИЯ =================
+
+
 
 @dp.message(F.location)
-async def location_received(message: types.Message, state: FSMContext):
-    if not await check_status(message): return
-    await state.clear()
-    user_id = message.from_user.id
-    all_user_ids.add(user_id)
-    user_locations[user_id] = (message.location.latitude, message.location.longitude)
-    await message.answer(get_text("location_saved"), reply_markup=await get_main_kb(message.from_user))
+async def save_location(
+        message: types.Message):
 
-# Профиль
-@dp.message(lambda msg: msg.text == "👤 Профиль")
-async def profile_menu(message: types.Message, state: FSMContext):
-    if not await check_status(message): return
-    await state.clear()
-    user_id = message.from_user.id
-    nick = user_nicknames.get(user_id, get_text("nick_not_set"))
-    text = get_text("profile_menu", nick=nick)
-    await message.answer(text, reply_markup=get_profile_kb(), parse_mode="HTML")
 
-@dp.message(lambda msg: msg.text == "✏️ Изменить ник")
-async def set_nick_start(message: types.Message, state: FSMContext):
-    if not await check_status(message): return
-    await state.set_state(SetNickname.waiting_for_nick)
-    await message.answer(get_text("set_nick_prompt"), reply_markup=get_cancel_kb())
+    if not await check_user(message):
 
-@dp.message(StateFilter(SetNickname.waiting_for_nick), F.text)
-async def set_nick_finish(message: types.Message, state: FSMContext):
-    if not await check_status(message): return
+        return
+
+
+
+    uid = message.from_user.id
+
+
+
+    user_locations[uid] = (
+
+        message.location.latitude,
+
+        message.location.longitude
+
+    )
+
+
+
+    await message.answer(
+
+        "✅ Геолокация сохранена",
+
+        reply_markup=
+        await main_keyboard(
+            message.from_user
+        )
+
+    )
+
+
+
+
+
+
+
+
+# ================= ПРОФИЛЬ =================
+
+
+
+@dp.message(
+    lambda m:
+    m.text == "👤 Профиль"
+)
+async def profile(
+        message: types.Message):
+
+
+    uid = message.from_user.id
+
+
+
+    nick = user_nicknames.get(
+
+        uid,
+
+        "не установлен"
+
+    )
+
+
+
+    kb = ReplyKeyboardMarkup(
+
+        keyboard=[
+
+            [
+
+                KeyboardButton(
+                    text="✏️ Изменить ник"
+                )
+
+            ],
+
+            [
+
+                KeyboardButton(
+                    text="↩ Назад"
+                )
+
+            ]
+
+        ],
+
+        resize_keyboard=True
+
+    )
+
+
+
+    await message.answer(
+
+        f"👤 Профиль\n\n"
+        f"Ник: {nick}",
+
+        reply_markup=kb
+
+    )
+
+
+
+
+
+
+@dp.message(
+    lambda m:
+    m.text == "✏️ Изменить ник"
+)
+async def nick_start(
+        message: types.Message,
+        state: FSMContext):
+
+
+    await state.set_state(
+        SetNickname.waiting_nick
+    )
+
+
+
+    await message.answer(
+        "Введите новый ник:"
+    )
+
+
+
+
+
+
+
+@dp.message(
+    StateFilter(SetNickname.waiting_nick),
+    F.text
+)
+async def nick_save(
+        message: types.Message,
+        state: FSMContext):
+
+
     nick = message.text.strip()
-    if not nick or not nick.isalnum() or len(nick) > 20:
-        await message.answer("❌ Некорректный ник. Используйте буквы/цифры, до 20 символов.")
+
+
+
+    if len(nick) > 20:
+
+        await message.answer(
+            "❌ Максимум 20 символов"
+        )
+
         return
-    user_id = message.from_user.id
-    user_nicknames[user_id] = nick
+
+
+
+
+    user_nicknames[
+        message.from_user.id
+    ] = nick
+
+
+
     await state.clear()
-    await message.answer(get_text("nick_saved", nick=nick), reply_markup=get_profile_kb())
 
-# --- Погода ---
-@dp.message(lambda msg: msg.text == "🌟 Погода")
-async def weather_menu(message: types.Message, state: FSMContext):
-    if not await check_status(message): return
-    await state.clear()
-    user_id = message.from_user.id
-    await message.answer(get_text("weather_menu"), reply_markup=await get_cities_kb(user_id))
 
-@dp.message(lambda msg: msg.text == "➕ Добавить город")
-async def add_city_start(message: types.Message, state: FSMContext):
-    if not await check_status(message): return
-    await state.set_state(AddCity.waiting_for_name)
-    await message.answer(get_text("add_city_prompt"), reply_markup=get_cancel_kb())
 
-@dp.message(StateFilter(AddCity.waiting_for_name), lambda msg: msg.text == "↩ Назад")
-async def add_city_cancel(message: types.Message, state: FSMContext):
-    await state.clear()
-    await weather_menu(message, state)
+    await message.answer(
 
-@dp.message(AddCity.waiting_for_name, F.text)
-async def add_city_name(message: types.Message, state: FSMContext):
-    if not await check_status(message): return
+        f"✅ Ник изменён: {nick}",
+
+        reply_markup=
+        await main_keyboard(
+            message.from_user
+        )
+
+    )
+            # ================= МЕНЮ ПОГОДЫ =================
+
+
+@dp.message(
+    lambda m:
+    m.text == "🌟 Погода"
+)
+async def weather_menu(
+        message: types.Message):
+
+
+    if not await check_user(message):
+        return
+
+
+    uid = message.from_user.id
+
+
+    buttons = []
+
+
+
+    for city in user_cities.get(uid, []):
+
+        buttons.append(
+
+            [
+
+                KeyboardButton(
+                    text=
+                    "🏙 " + city["name"]
+                )
+
+            ]
+
+        )
+
+
+
+    buttons.append(
+
+        [
+
+            KeyboardButton(
+                text="➕ Добавить город"
+            )
+
+        ]
+
+    )
+
+
+    buttons.append(
+
+        [
+
+            KeyboardButton(
+                text="↩ Назад"
+            )
+
+        ]
+
+    )
+
+
+
+    await message.answer(
+
+        "🌟 Выберите город:",
+
+        reply_markup=
+        ReplyKeyboardMarkup(
+            keyboard=buttons,
+            resize_keyboard=True
+        )
+
+    )
+
+
+
+
+
+
+# ================= ДОБАВЛЕНИЕ ГОРОДА =================
+
+
+
+@dp.message(
+    lambda m:
+    m.text == "➕ Добавить город"
+)
+async def add_city(
+        message: types.Message,
+        state: FSMContext):
+
+
+    await state.set_state(
+        AddCity.waiting_name
+    )
+
+
+    await message.answer(
+        "🏙 Напишите название города:"
+    )
+
+
+
+
+
+@dp.message(
+    StateFilter(AddCity.waiting_name),
+    F.text
+)
+async def save_city(
+        message: types.Message,
+        state: FSMContext):
+
+
     city_name = message.text.strip()
-    user_id = message.from_user.id
-    if not city_name:
-        await message.answer("Введите название")
-        return
-    msg = await message.answer(get_text("searching_coords"))
-    coords = await geocode_city(city_name)
+
+
+
+    msg = await message.answer(
+        "⏳ Ищу город..."
+    )
+
+
+
+    coords = await geocode_city(
+        city_name
+    )
+
+
+
     if not coords:
-        await msg.edit_text(get_text("city_not_found", city=city_name))
-        return
-    lat, lon = coords
-    if user_id not in user_cities:
-        user_cities[user_id] = []
-    if any(c['name'].lower() == city_name.lower() for c in user_cities[user_id]):
-        await msg.edit_text(get_text("city_already_exists", city=city_name))
-        await state.clear()
-        await weather_menu(message, state)
-        return
-    user_cities[user_id].append({"name": city_name, "lat": lat, "lon": lon})
-    await state.clear()
-    await msg.edit_text(get_text("city_added", city=city_name))
-    await weather_menu(message, state)
 
-@dp.message(lambda msg: msg.text and msg.text.startswith("🏙 "))
-async def show_city_weather(message: types.Message, state: FSMContext):
-    if not await check_status(message): return
+
+        await msg.edit_text(
+            "❌ Город не найден"
+        )
+
+        return
+
+
+
+
+
+    uid = message.from_user.id
+
+
+
+    if uid not in user_cities:
+
+        user_cities[uid] = []
+
+
+
+    user_cities[uid].append(
+
+        {
+
+            "name":
+            city_name,
+
+            "lat":
+            coords[0],
+
+            "lon":
+            coords[1]
+
+        }
+
+    )
+
+
+
     await state.clear()
-    city_name = message.text[2:].strip()
-    user_id = message.from_user.id
-    cities = user_cities.get(user_id, [])
-    city = next((c for c in cities if c['name'] == city_name), None)
+
+
+
+    await msg.edit_text(
+
+        f"✅ Город {city_name} добавлен"
+
+    )
+
+
+
+    await message.answer(
+
+        "Главное меню:",
+
+        reply_markup=
+        await main_keyboard(
+            message.from_user
+        )
+
+    )
+
+
+
+
+
+
+
+# ================= ПОКАЗ ПОГОДЫ =================
+
+
+
+@dp.message(
+    lambda m:
+    m.text and
+    m.text.startswith("🏙 ")
+)
+async def city_weather(
+        message: types.Message):
+
+
+    uid = message.from_user.id
+
+
+
+    city_name = (
+        message.text[2:]
+        .strip()
+    )
+
+
+
+    city = None
+
+
+
+    for c in user_cities.get(uid, []):
+
+        if c["name"] == city_name:
+
+            city = c
+            break
+
+
+
     if not city:
-        await message.answer("Город не найден")
+
+        await message.answer(
+            "❌ Город не найден"
+        )
+
         return
-    msg = await message.answer(get_text("loading_weather", city=city_name))
+
+
+
+
+
+    loading = await message.answer(
+        "⏳ Загружаю погоду..."
+    )
+
+
+
     try:
-        weather = await get_weather_by_coords(city["lat"], city["lon"], city_name)
+
+
+        weather = await get_weather(
+
+            city["lat"],
+
+            city["lon"],
+
+            city_name
+
+        )
+
+
+
+        text = (
+
+            f"🌍 {weather['city']}\n\n"
+
+            f"{weather['desc']}\n"
+
+            f"🌡 Температура: "
+            f"{weather['temp']}°C\n"
+
+            f"🤔 Ощущается: "
+            f"{weather['feels']}°C\n"
+
+            f"💧 Влажность: "
+            f"{weather['humidity']}%\n"
+
+            f"☁ Облачность: "
+            f"{weather['cloud']}%\n"
+
+            f"🔵 Давление: "
+            f"{weather['pressure']} мм"
+
+        )
+
+
+
+        await loading.edit_text(
+            text
+        )
+
+
+
     except Exception as e:
-        await msg.edit_text(get_text("weather_error", error=str(e)))
-        return
 
-    frame = TEXT["weather_frame"].format(**weather)
-    now_text = TEXT["now_in_city"].format(city=weather['city'], desc=weather['desc'])
-    text = f"📅 <b>{weather['local_time']}</b>\n\n{frame}\n\n<i>{now_text}</i>"
-    await msg.edit_text(text, parse_mode="HTML")
-    await weather_menu(message, state)
 
-# --- Курсы валют ---
-@dp.message(lambda msg: msg.text == "💰 Курсы валют")
-async def currency_menu(message: types.Message, state: FSMContext):
-    if not await check_status(message): return
-    await state.clear()
-    await message.answer(get_text("currency_menu"), reply_markup=get_currency_kb())
+        await loading.edit_text(
 
-@dp.message(lambda msg: msg.text in ["🇺🇸 USD/RUB", "🇪🇺 EUR/RUB"])
-async def show_fiat_currency(message: types.Message, state: FSMContext):
-    if not await check_status(message): return
-    pair = message.text.split()[1]
-    msg = await message.answer(get_text("loading_currency", pair=pair))
+            f"❌ Ошибка: {e}"
+
+        )
+
+
+
+
+
+
+
+# ================= ВАЛЮТА =================
+
+
+
+@dp.message(
+    lambda m:
+    m.text == "💰 Курсы валют"
+)
+async def currency(
+        message: types.Message):
+
+
     try:
-        cbr_data = await get_cbr_currency()
-        valutes = cbr_data["Valute"]
-        if pair == "USD/RUB":
-            current = valutes["USD"]["Value"]
-            prev_day = valutes["USD"]["Previous"]
-            valute_key = "USD"
-        else:
-            current = valutes["EUR"]["Value"]
-            prev_day = valutes["EUR"]["Previous"]
-            valute_key = "EUR"
-        change_24 = current - prev_day
-        change_24_pct = (change_24 / prev_day) * 100
-        arrow_24 = "🔺" if change_24 > 0 else "🔻" if change_24 < 0 else "▪️"
-        week_ago = (datetime.now(MOSCOW_TZ) - timedelta(days=7)).strftime("%Y/%m/%d")
-        week_info = ""
-        try:
-            hist_data = await get_cbr_historical(week_ago)
-            week_val = hist_data["Valute"][valute_key]["Value"]
-            change_week = current - week_val
-            change_week_pct = (change_week / week_val) * 100
-            arrow_week = "🔺" if change_week > 0 else "🔻" if change_week < 0 else "▪️"
-            week_info = f"📆 За неделю: {arrow_week} {change_week:+.2f} ₽ ({change_week_pct:+.2f}%)"
-        except:
-            week_info = "📆 За неделю: нет данных"
-        now_moscow = datetime.now(MOSCOW_TZ)
-        time_str = now_moscow.strftime("%H:%M:%S")
-        date_str = f"{now_moscow.day} {MONTHS_RU[now_moscow.month]} {now_moscow.year}, {WEEKDAYS_RU[now_moscow.weekday()]}"
-        info = get_text("fiat_info", date=date_str, time=time_str, pair=pair, current=current, arrow_24=arrow_24, change_24=change_24, change_24_pct=change_24_pct, week_info=week_info)
-        await msg.edit_text(info, parse_mode="HTML")
+
+
+        data = await get_currency()
+
+
+
+        usd = (
+            data["Valute"]
+            ["USD"]
+            ["Value"]
+        )
+
+
+        eur = (
+            data["Valute"]
+            ["EUR"]
+            ["Value"]
+        )
+
+
+
+        await message.answer(
+
+            "💰 Курсы ЦБ РФ\n\n"
+
+            f"🇺🇸 USD: {usd:.2f} ₽\n"
+
+            f"🇪🇺 EUR: {eur:.2f} ₽"
+
+        )
+
+
+
     except Exception as e:
-        await msg.edit_text(f"❌ Ошибка: {e}")
 
-@dp.message(lambda msg: msg.text == "💎 TON/RUB")
-async def show_ton(message: types.Message, state: FSMContext):
-    if not await check_status(message): return
-    msg = await message.answer("⏳ Загружаю данные TON...")
-    try:
-        ton = await get_ton_price()
-        if not ton:
-            await msg.edit_text("❌ Не удалось загрузить курс TON")
-            return
-        cbr_data = await get_cbr_currency()
-        usd_rub = cbr_data["Valute"]["USD"]["Value"]
-        ton_rub = ton["usd"] * usd_rub
-        change_pct = ton["change_24h_pct"]
-        arrow = "🔺" if change_pct > 0 else "🔻" if change_pct < 0 else "▪️"
-        now_moscow = datetime.now(MOSCOW_TZ)
-        time_str = now_moscow.strftime("%H:%M:%S")
-        date_str = f"{now_moscow.day} {MONTHS_RU[now_moscow.month]} {now_moscow.year}, {WEEKDAYS_RU[now_moscow.weekday()]}"
-        info = get_text("ton_info", date=date_str, time=time_str, ton_rub=ton_rub, ton_usd=ton["usd"], arrow=arrow, change_pct=change_pct)
-        await msg.edit_text(info, parse_mode="HTML")
-    except Exception as e:
-        await msg.edit_text(f"❌ Ошибка: {e}")
 
-# --- АДМИН-ПАНЕЛЬ ---
-@dp.message(lambda msg: msg.text == "🔧 Админ")
-async def admin_menu(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user): return
+        await message.answer(
+
+            f"❌ Ошибка: {e}"
+
+        )
+
+
+
+
+
+
+
+# ================= НАЗАД =================
+
+
+
+@dp.message(
+    lambda m:
+    m.text == "↩ Назад"
+)
+async def back(
+        message: types.Message,
+        state: FSMContext):
+
+
     await state.clear()
-    kb = [
-        [KeyboardButton(text="👥 Пользователи")],
-        [KeyboardButton(text="📨 Рассылка")],
-        [KeyboardButton(text="💬 Управление чатом")],
-        [KeyboardButton(text="📋 Белый лист")],
-        [KeyboardButton(text="↩ Назад")]
-    ]
-    await message.answer(get_text("admin_menu"), reply_markup=ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True), parse_mode="HTML")
 
-@dp.message(lambda msg: msg.text == "👥 Пользователи")
-async def admin_users_list(message: types.Message):
-    if not is_admin(message.from_user): return
-    user_ids = list(all_user_ids)
-    if not user_ids:
-        await message.answer("Нет пользователей")
-        return
-    markup = InlineKeyboardMarkup(inline_keyboard=[])
-    for uid in user_ids[:50]:
-        try:
-            user = await bot.get_chat(uid)
-            uname = f"@{user.username}" if user.username else f"id{uid}"
-        except:
-            uname = f"id{uid}"
-        markup.inline_keyboard.append([
-            InlineKeyboardButton(text=f"{uname}", callback_data=f"user_{uid}")
-        ])
-    await message.answer("👥 Список пользователей:", reply_markup=markup)
 
-@dp.callback_query(F.data.startswith("user_"))
-async def user_actions_menu(call: CallbackQuery):
-    if not is_admin(call.from_user): return
-    target_id = int(call.data.split("_")[1])
-    status = user_statuses.get(target_id, "active")
-    kb = InlineKeyboardMarkup(inline_keyboard=[])
-    if status != "banned":
-        kb.inline_keyboard.append([InlineKeyboardButton(text="Забанить", callback_data=f"ban_{target_id}")])
-    if status != "muted":
-        kb.inline_keyboard.append([InlineKeyboardButton(text="Замутить", callback_data=f"mute_{target_id}")])
-    kb.inline_keyboard.append([InlineKeyboardButton(text="↩ Назад", callback_data="back_to_users")])
-    await call.message.edit_reply_markup(reply_markup=kb)
 
-@dp.callback_query(F.data.startswith("ban_"))
-async def ban_user(call: CallbackQuery):
-    if not is_admin(call.from_user): return
-    target_id = int(call.data.split("_")[1])
-    user_statuses[target_id] = "banned"
-    await call.answer(f"Пользователь {target_id} забанен")
-    await admin_users_list(call.message)
+    await message.answer(
 
-@dp.callback_query(F.data.startswith("mute_"))
-async def mute_user(call: CallbackQuery):
-    if not is_admin(call.from_user): return
-    target_id = int(call.data.split("_")[1])
-    user_statuses[target_id] = "muted"
-    await call.answer(f"Пользователь {target_id} замучен")
-    await admin_users_list(call.message)
+        "🌈 Главное меню:",
 
-@dp.callback_query(F.data == "back_to_users")
-async def back_to_users(call: CallbackQuery):
-    await admin_users_list(call.message)
+        reply_markup=
+        await main_keyboard(
+            message.from_user
+        )
 
-@dp.message(lambda msg: msg.text == "📋 Белый лист")
-async def whitelist_menu(message: types.Message):
-    if not is_admin(message.from_user): return
-    blocked = [(uid, st) for uid, st in user_statuses.items() if st != "active"]
-    if not blocked:
-        await message.answer(get_text("whitelist_empty"))
-        return
-    markup = InlineKeyboardMarkup(inline_keyboard=[])
-    for uid, st in blocked:
-        try:
-            user = await bot.get_chat(uid)
-            uname = f"@{user.username}" if user.username else f"id{uid}"
-        except:
-            uname = f"id{uid}"
-        cb = f"unban_{uid}" if st == "banned" else f"unmute_{uid}"
-        btn_text = "Разбанить" if st == "banned" else "Размутить"
-        markup.inline_keyboard.append([
-            InlineKeyboardButton(text=f"{uname} ({st})", callback_data=f"info_{uid}"),
-            InlineKeyboardButton(text=btn_text, callback_data=cb)
-        ])
-    await message.answer("📋 Белый лист:", reply_markup=markup)
+    )
 
-@dp.callback_query(F.data.startswith("unban_"))
-async def unban_user(call: CallbackQuery):
-    if not is_admin(call.from_user): return
-    target_id = int(call.data.split("_")[1])
-    user_statuses[target_id] = "active"
-    await call.answer(f"Пользователь {target_id} разбанен")
-    await whitelist_menu(call.message)
 
-@dp.callback_query(F.data.startswith("unmute_"))
-async def unmute_user(call: CallbackQuery):
-    if not is_admin(call.from_user): return
-    target_id = int(call.data.split("_")[1])
-    user_statuses[target_id] = "active"
-    await call.answer(f"Пользователь {target_id} размучен")
-    await whitelist_menu(call.message)
 
-@dp.message(lambda msg: msg.text == "📨 Рассылка")
-async def broadcast_start(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user): return
-    await state.set_state(Broadcast.waiting_for_message)
-    await message.answer("📨 Введите сообщение для рассылки:", reply_markup=get_cancel_kb())
 
-@dp.message(StateFilter(Broadcast.waiting_for_message), lambda msg: msg.text == "↩ Назад")
-async def broadcast_cancel(message: types.Message, state: FSMContext):
-    await state.clear()
-    await admin_menu(message, state)
 
-@dp.message(Broadcast.waiting_for_message)
-async def broadcast_send(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user): return
-    await state.clear()
-    sent = 0
-    for uid in list(all_user_ids):
-        try:
-            await bot.send_message(uid, message.text)
-            sent += 1
-        except Exception as e:
-            logging.warning(f"Не удалось отправить сообщение {uid}: {e}")
-    await message.answer(get_text("broadcast_sent", count=sent), reply_markup=await get_main_kb(message.from_user))
 
-# Управление чатом
-@dp.message(lambda msg: msg.text == "💬 Управление чатом")
-async def admin_chat_manage(message: types.Message):
-    if not is_admin(message.from_user): return
-    global chat_enabled
-    count = len(chat_users)
-    status = "включён" if chat_enabled else "выключен"
-    text = f"💬 <b>Управление чатом</b>\nУчастников: {count}\nСтатус: {status}"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="Выключить чат" if chat_enabled else "Включить чат",
-            callback_data="toggle_chat"
-        )],
-        [InlineKeyboardButton(text="↩ Назад", callback_data="admin_back")]
-    ])
-    await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
-@dp.callback_query(F.data == "toggle_chat")
-async def toggle_chat_global(call: CallbackQuery):
-    if not is_admin(call.from_user): return
-    global chat_enabled
-    chat_enabled = not chat_enabled
+# ================= ЧАТ =================
+
+
+
+@dp.message(
+    lambda m:
+    m.text == "💬 Чат"
+)
+async def chat_enter(
+        message: types.Message):
+
+
     if not chat_enabled:
-        for uid in chat_users.copy():
+
+
+        await message.answer(
+            "💬 Чат сейчас отключён"
+        )
+
+        return
+
+
+
+    uid = message.from_user.id
+
+
+
+    if uid in chat_users:
+
+
+        chat_users.remove(uid)
+
+
+
+        await message.answer(
+            "💬 Вы вышли из чата"
+        )
+
+
+        return
+
+
+
+
+
+    chat_users.add(uid)
+
+
+
+    name = await display_name(uid)
+
+
+
+    log_action(
+        f"{name} вошёл в чат"
+    )
+
+
+
+    await message.answer(
+        "💬 Вы вошли в чат"
+    )
+
+
+
+    for user in chat_users.copy():
+
+        if user != uid:
+
             try:
-                await bot.send_message(uid, "💬 Чат временно отключён.")
-            except: pass
-        chat_users.clear()
-    await call.message.edit_text("✅ Общий чат включён." if chat_enabled else "🛑 Общий чат выключен.")
-    await call.answer()
 
-@dp.callback_query(F.data == "admin_back")
-async def admin_back(call: CallbackQuery):
-    await call.message.delete()
-    await admin_menu(call.message, None)
+                await bot.send_message(
 
-# Чат для обычных пользователей
-@dp.message(lambda msg: msg.text == "💬 Чат")
-async def toggle_chat(message: types.Message):
-    if not await check_status(message): return
-    if not chat_enabled:
-        await message.answer(get_text("chat_off"))
+                    user,
+
+                    f"👋 {name} вошёл в чат"
+
+                )
+
+            except:
+
+                chat_users.discard(user)
+                # ================= ЧАТ СООБЩЕНИЯ =================
+
+
+@dp.message(F.sticker)
+async def chat_sticker(
+        message: types.Message):
+
+
+    uid = message.from_user.id
+
+
+    if (
+        uid not in chat_users
+        or not chat_enabled
+    ):
         return
-    user_id = message.from_user.id
-    if user_id in chat_users:
-        chat_users.discard(user_id)
-        await message.answer(get_text("chat_leave"))
-    else:
-        chat_users.add(user_id)
-        await message.answer(get_text("chat_enter"))
-        name = await get_display_name(user_id)
-        for uid in chat_users:
-            if uid != user_id:
-                try:
-                    await bot.send_message(uid, get_text("chat_joined", name=name))
-                except:
-                    pass
 
-@dp.message(F.text, ~F.text.in_(["🌟 Погода", "💰 Курсы валют", "↩ Назад",
-                                "➕ Добавить город", "💬 Чат", "🔧 Админ",
-                                "👥 Пользователи", "📨 Рассылка", "📋 Белый лист",
-                                "💬 Управление чатом", "👤 Профиль", "✏️ Изменить ник"]))
-async def chat_message_handler(message: types.Message):
-    if not await check_status(message): return
-    user_id = message.from_user.id
-    if user_id not in chat_users or not chat_enabled:
-        return
-    name = await get_display_name(user_id)
-    for uid in chat_users.copy():
-        if uid == user_id: continue
+
+
+    name = await display_name(uid)
+
+
+
+    for user in chat_users.copy():
+
+        if user == uid:
+            continue
+
+
         try:
-            await bot.send_message(uid, f"💬 {name}: {message.text}")
+
+            await bot.send_sticker(
+
+                user,
+
+                message.sticker.file_id
+
+            )
+
+
         except:
-            chat_users.discard(uid)
 
-@dp.message(lambda msg: msg.text == "↩ Назад")
-async def back_to_main(message: types.Message, state: FSMContext):
+            chat_users.discard(user)
+
+
+
+
+
+
+@dp.message(F.text)
+async def chat_text(
+        message: types.Message):
+
+
+    uid = message.from_user.id
+
+
+
+    ignored = [
+
+        "🌟 Погода",
+
+        "💰 Курсы валют",
+
+        "📰 Новости",
+
+        "👤 Профиль",
+
+        "💬 Чат",
+
+        "🔧 Админ",
+
+        "↩ Назад",
+
+        "➕ Добавить город",
+
+        "✏️ Изменить ник"
+
+    ]
+
+
+
+    if (
+
+        uid not in chat_users
+
+        or not chat_enabled
+
+        or message.text in ignored
+
+    ):
+
+        return
+
+
+
+
+    name = await display_name(uid)
+
+
+
+    for user in chat_users.copy():
+
+
+        if user == uid:
+            continue
+
+
+        try:
+
+
+            await bot.send_message(
+
+                user,
+
+                f"💬 {name}: {message.text}",
+
+                reply_to_message_id=
+                message.message_id
+
+            )
+
+
+
+        except:
+
+
+            chat_users.discard(user)
+
+
+
+
+
+
+
+# ================= НОВОСТИ =================
+
+
+NEWS_SOURCES = [
+
+    "https://lenta.ru/rss",
+
+    "https://ria.ru/export/rss2/archive/index.xml"
+
+]
+
+
+
+news_cache = []
+
+
+
+
+
+
+
+async def load_news():
+
+
+    global news_cache
+
+
+    result = []
+
+
+
+    try:
+
+
+        async with aiohttp.ClientSession() as session:
+
+
+            async with session.get(
+                NEWS_SOURCES[0]
+            ) as response:
+
+
+                text = await response.text()
+
+
+
+        import xml.etree.ElementTree as ET
+
+
+
+        root = ET.fromstring(text)
+
+
+
+        for item in root.findall(
+            ".//item"
+        )[:10]:
+
+
+            title = item.findtext(
+                "title"
+            )
+
+
+            link = item.findtext(
+                "link"
+            )
+
+
+
+            if title:
+
+                result.append(
+
+                    {
+
+                        "title": title,
+
+                        "link": link
+
+                    }
+
+                )
+
+
+
+        news_cache = result
+
+
+
+    except Exception as e:
+
+
+        logging.error(
+            f"News error {e}"
+        )
+
+
+
+    return news_cache
+
+
+
+
+
+
+@dp.message(
+    lambda m:
+    m.text == "📰 Новости"
+)
+async def news_menu(
+        message: types.Message):
+
+
+    news = await load_news()
+
+
+
+    if not news:
+
+
+        await message.answer(
+            "❌ Новости недоступны"
+        )
+
+        return
+
+
+
+
+    buttons = []
+
+
+
+    for i, item in enumerate(news):
+
+
+        buttons.append(
+
+            [
+
+                InlineKeyboardButton(
+
+                    text=
+                    item["title"][:50],
+
+                    url=
+                    item["link"]
+
+                )
+
+            ]
+
+        )
+
+
+
+    await message.answer(
+
+        "📰 Последние новости:",
+
+        reply_markup=
+        InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        )
+
+    )
+
+
+
+
+
+
+
+# ================= ПОИСК НОВОСТЕЙ =================
+
+
+
+@dp.message(
+    Command("search")
+)
+async def search_news_start(
+        message: types.Message,
+        state: FSMContext):
+
+
+    await state.set_state(
+        NewsSearch.waiting_text
+    )
+
+
+    await message.answer(
+
+        "🔍 Напишите слово для поиска:"
+
+    )
+
+
+
+
+
+@dp.message(
+    StateFilter(
+        NewsSearch.waiting_text
+    ),
+    F.text
+)
+async def search_news(
+        message: types.Message,
+        state: FSMContext):
+
+
+    query = message.text.lower()
+
+
+
+    news = await load_news()
+
+
+
+    found = []
+
+
+
+    for item in news:
+
+
+        if query in item["title"].lower():
+
+            found.append(item)
+
+
+
+
+
     await state.clear()
-    user_id = message.from_user.id
-    loc = user_locations.get(user_id)
-    if loc:
-        await message.answer(get_text("welcome_back"), reply_markup=await get_main_kb(message.from_user), parse_mode="HTML")
-    else:
-        await message.answer(get_text("welcome_new"), reply_markup=get_location_kb(), parse_mode="HTML")
 
-# ---------- ВЕБ-СЕРВЕР ----------
-async def handle(request):
-    return web.Response(text="Bot is running")
+
+
+    if not found:
+
+
+        await message.answer(
+            "❌ Ничего не найдено"
+        )
+
+        return
+
+
+
+
+
+    buttons = []
+
+
+
+    for item in found:
+
+
+        buttons.append(
+
+            [
+
+                InlineKeyboardButton(
+
+                    text=
+                    item["title"][:50],
+
+                    url=
+                    item["link"]
+
+                )
+
+            ]
+
+        )
+
+
+
+    await message.answer(
+
+        "🔍 Результаты:",
+
+        reply_markup=
+        InlineKeyboardMarkup(
+            inline_keyboard=buttons
+        )
+
+    )
+
+
+
+
+
+
+
+
+# ================= ИЗБРАННОЕ =================
+
+
+
+@dp.message(
+    Command("favorite")
+)
+async def add_favorite(
+        message: types.Message):
+
+
+    uid = message.from_user.id
+
+
+
+    if uid not in favorite_news:
+
+        favorite_news[uid] = []
+
+
+
+    await message.answer(
+
+        "⭐ Используйте кнопку "
+        "сохранения новости "
+        "(добавим в следующей части)"
+
+    )
+
+
+
+
+
+
+# ================= ПОДПИСКИ =================
+
+
+
+@dp.message(
+    Command("subscribe")
+)
+async def subscribe_news(
+        message: types.Message):
+
+
+    uid = message.from_user.id
+
+
+
+    news_subscribers[uid] = True
+
+
+
+    await message.answer(
+
+        "🔔 Вы подписались "
+        "на новости"
+
+    )
+            # ================= АДМИН ПАНЕЛЬ =================
+
+
+@dp.message(
+    lambda m:
+    m.text == "🔧 Админ"
+)
+async def admin_menu(
+        message: types.Message):
+
+
+    if not is_admin(
+        message.from_user
+    ):
+        return
+
+
+
+    kb = ReplyKeyboardMarkup(
+
+        keyboard=[
+
+            [
+
+                KeyboardButton(
+                    text="👥 Статистика"
+                )
+
+            ],
+
+            [
+
+                KeyboardButton(
+                    text="📨 Рассылка"
+                )
+
+            ],
+
+            [
+
+                KeyboardButton(
+                    text="🚫 Управление"
+                )
+
+            ],
+
+            [
+
+                KeyboardButton(
+                    text="📋 Логи"
+                )
+
+            ],
+
+            [
+
+                KeyboardButton(
+                    text="💬 Вкл/Выкл чат"
+                )
+
+            ],
+
+            [
+
+                KeyboardButton(
+                    text="↩ Назад"
+                )
+
+            ]
+
+        ],
+
+        resize_keyboard=True
+
+    )
+
+
+
+    await message.answer(
+
+        "🔧 Админ-панель",
+
+        reply_markup=kb
+
+    )
+
+
+
+
+
+
+# ================= СТАТИСТИКА =================
+
+
+
+@dp.message(
+    lambda m:
+    m.text == "👥 Статистика"
+)
+async def statistics(
+        message: types.Message):
+
+
+    if not is_admin(
+        message.from_user
+    ):
+        return
+
+
+
+    top = sorted(
+
+        user_activity.items(),
+
+        key=lambda x: x[1],
+
+        reverse=True
+
+    )[:10]
+
+
+
+    text = (
+
+        "📊 Статистика\n\n"
+
+        f"👤 Пользователей: "
+        f"{len(all_user_ids)}\n"
+
+        f"💬 Сообщений: "
+        f"{message_count}\n\n"
+
+        "🏆 Топ:\n"
+
+    )
+
+
+
+    for uid, count in top:
+
+
+        text += (
+
+            f"{uid}: "
+            f"{count}\n"
+
+        )
+
+
+
+    await message.answer(text)
+
+
+
+
+
+
+
+# ================= РАССЫЛКА =================
+
+
+
+@dp.message(
+    lambda m:
+    m.text == "📨 Рассылка"
+)
+async def broadcast_start(
+        message: types.Message,
+        state: FSMContext):
+
+
+    if not is_admin(
+        message.from_user
+    ):
+        return
+
+
+
+    await state.set_state(
+        Broadcast.waiting_message
+    )
+
+
+
+    await message.answer(
+
+        "📨 Введите текст рассылки:"
+
+    )
+
+
+
+
+
+
+@dp.message(
+    StateFilter(
+        Broadcast.waiting_message
+    ),
+    F.text
+)
+async def broadcast_send(
+        message: types.Message,
+        state: FSMContext):
+
+
+    if not is_admin(
+        message.from_user
+    ):
+        return
+
+
+
+    sent = 0
+
+
+
+    for uid in all_user_ids.copy():
+
+
+        try:
+
+
+            await bot.send_message(
+
+                uid,
+
+                message.text
+
+            )
+
+
+            sent += 1
+
+
+
+        except:
+
+
+            pass
+
+
+
+
+    await state.clear()
+
+
+
+    await message.answer(
+
+        f"✅ Отправлено: {sent}"
+
+    )
+
+
+
+
+
+
+
+# ================= БАН / МУТ =================
+
+
+
+@dp.message(
+    lambda m:
+    m.text == "🚫 Управление"
+)
+async def manage_users(
+        message: types.Message):
+
+
+    if not is_admin(
+        message.from_user
+    ):
+        return
+
+
+
+    await message.answer(
+
+        "Команды:\n\n"
+
+        "/ban ID\n"
+
+        "/mute ID\n"
+
+        "/unban ID\n"
+
+        "/unmute ID"
+
+    )
+
+
+
+
+
+
+@dp.message(
+    Command("ban")
+)
+async def ban_user(
+        message: types.Message):
+
+
+    if not is_admin(
+        message.from_user
+    ):
+        return
+
+
+
+    try:
+
+
+        uid = int(
+            message.text.split()[1]
+        )
+
+
+        user_statuses[uid] = "banned"
+
+
+        log_action(
+            f"{uid} заблокирован"
+        )
+
+
+        await message.answer(
+            "⛔ Пользователь заблокирован"
+        )
+
+
+    except:
+
+
+        await message.answer(
+            "Использование: /ban ID"
+        )
+
+
+
+
+
+
+
+@dp.message(
+    Command("mute")
+)
+async def mute_user(
+        message: types.Message):
+
+
+    if not is_admin(
+        message.from_user
+    ):
+        return
+
+
+
+    try:
+
+
+        uid = int(
+            message.text.split()[1]
+        )
+
+
+        user_statuses[uid] = "muted"
+
+
+
+        await message.answer(
+            "🔇 Пользователь замучен"
+        )
+
+
+    except:
+
+
+        await message.answer(
+            "Использование: /mute ID"
+        )
+
+
+
+
+
+
+
+@dp.message(
+    Command("unban")
+)
+async def unban_user(
+        message: types.Message):
+
+
+    if not is_admin(
+        message.from_user
+    ):
+        return
+
+
+
+    uid = int(
+        message.text.split()[1]
+    )
+
+
+    user_statuses[uid] = "active"
+
+
+
+    await message.answer(
+        "✅ Разблокирован"
+    )
+
+
+
+
+
+
+
+@dp.message(
+    Command("unmute")
+)
+async def unmute_user(
+        message: types.Message):
+
+
+    if not is_admin(
+        message.from_user
+    ):
+        return
+
+
+
+    uid = int(
+        message.text.split()[1]
+    )
+
+
+    user_statuses[uid] = "active"
+
+
+
+    await message.answer(
+        "✅ Мут снят"
+    )
+
+
+
+
+
+
+
+
+# ================= ЛОГИ =================
+
+
+
+@dp.message(
+    lambda m:
+    m.text == "📋 Логи"
+)
+async def logs(
+        message: types.Message):
+
+
+    if not is_admin(
+        message.from_user
+    ):
+        return
+
+
+
+    text = "📋 Последние действия:\n\n"
+
+
+
+    for item in admin_logs[-20:]:
+
+
+        text += (
+
+            f"{item['time']} "
+            f"- "
+            f"{item['text']}\n"
+
+        )
+
+
+
+    await message.answer(text)
+
+
+
+
+
+
+
+
+# ================= ЧАТ ПЕРЕКЛЮЧАТЕЛЬ =================
+
+
+
+@dp.message(
+    lambda m:
+    m.text == "💬 Вкл/Выкл чат"
+)
+async def toggle_chat(
+        message: types.Message):
+
+
+    global chat_enabled
+
+
+
+    if not is_admin(
+        message.from_user
+    ):
+        return
+
+
+
+    chat_enabled = not chat_enabled
+
+
+
+    if not chat_enabled:
+
+        chat_users.clear()
+
+
+
+    await message.answer(
+
+        "💬 Чат: "
+
+        +
+
+        (
+            "включён"
+            if chat_enabled
+            else
+            "выключен"
+        )
+
+    )
+
+
+
+
+
+
+
+
+# ================= АВТОНОВОСТИ =================
+
+
+
+async def news_task():
+
+
+    while True:
+
+
+        await asyncio.sleep(
+            1800
+        )
+
+
+        if not news_subscribers:
+
+            continue
+
+
+
+        news = await load_news()
+
+
+
+        if not news:
+
+            continue
+
+
+
+        item = news[0]
+
+
+
+        text = (
+
+            "📰 Новость:\n\n"
+
+            f"{item['title']}\n\n"
+
+            f"{item['link']}"
+
+        )
+
+
+
+        for uid in list(
+            news_subscribers.keys()
+        ):
+
+
+            try:
+
+
+                await bot.send_message(
+
+                    uid,
+
+                    text
+
+                )
+
+
+            except:
+
+
+                pass
+
+
+
+
+
+
+
+# ================= RENDER =================
+
+
+
+async def home(
+        request):
+
+
+    return web.Response(
+
+        text=
+        "Новости · Вузи работает"
+
+    )
+
+
+
+
+
 
 async def main():
+
+
     app = web.Application()
-    app.router.add_get('/', handle)
-    runner = web.AppRunner(app)
+
+
+
+    app.router.add_get(
+        "/",
+        home
+    )
+
+
+
+    runner = web.AppRunner(
+        app
+    )
+
+
     await runner.setup()
-    port = int(os.environ.get("PORT", 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
+
+
+
+    port = int(
+
+        os.getenv(
+            "PORT",
+            8080
+        )
+
+    )
+
+
+
+    site = web.TCPSite(
+
+        runner,
+
+        "0.0.0.0",
+
+        port
+
+    )
+
+
+
     await site.start()
-    logging.info(f"Web server started on port {port}")
-    await dp.start_polling(bot)
+
+
+
+    asyncio.create_task(
+        news_task()
+    )
+
+
+
+    logging.info(
+        "Bot started"
+    )
+
+
+
+    await dp.start_polling(
+        bot
+    )
+
+
+
+
+
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+
+
+    asyncio.run(
+        main()
+    )
