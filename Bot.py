@@ -20,7 +20,7 @@ ADMIN_USERNAMES = ["Woozinoid", "HwangMinw"]
 MOSCOW_TZ = timezone(timedelta(hours=3))
 EKAT_TZ = timezone(timedelta(hours=5))   # Екатеринбург
 
-PUBLISH_INTERVAL = 5  # секунд (для теста, после теста замените на 150*60)
+PUBLISH_INTERVAL = 10 #секунд (для теста, после теста замените на 150*60)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -110,7 +110,8 @@ async def publisher():
             await bot.send_message(
                 chat_id=CHANNEL_ID,
                 text=post_data["text"],
-                parse_mode="HTML"
+                parse_mode="HTML",
+                disable_web_page_preview=True   # ← отключаем превью
             )
             reset_daily_stats()
             daily_stats["sent"] += 1
@@ -257,14 +258,13 @@ async def suggest_prompt(message: types.Message):
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_text(message: types.Message):
-    # Игнорируем сообщения от каналов
     if message.sender_chat or message.chat.type == "channel":
         return
     user = message.from_user
     if not user:
         return
     uid = user.id
-    if uid == 777000:  # Telegram
+    if uid == 777000:
         return
 
     if uid in banned_users:
@@ -300,7 +300,6 @@ async def handle_text(message: types.Message):
     if corrected_text != original_text:
         await notify_admins(corrected_text, user, "✅ ИСПРАВЛЕНО")
 
-    # Формируем пост БЕЗ автора, с кликабельной ссылкой на канал
     post_text = (
         f"{corrected_text}\n\n"
         f"<a href='https://t.me/WoozinoidLife'>ИЩУ ТЕБЯ ЕКАТЕРИНБУРГ ПОДПИСЫВАЙТЕСЬ</a>"
