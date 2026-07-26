@@ -20,7 +20,7 @@ ADMIN_USERNAMES = ["Woozinoid", "HwangMinw"]
 MOSCOW_TZ = timezone(timedelta(hours=3))
 EKAT_TZ = timezone(timedelta(hours=5))   # Екатеринбург
 
-PUBLISH_INTERVAL = 30  # секунд (для теста, потом замените на 150*60)
+PUBLISH_INTERVAL = 5  # секунд (для теста, после теста замените на 150*60)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -207,7 +207,7 @@ async def start_cmd(message: types.Message):
         "которое после проверки грамматики будет опубликовано в канале.\n\n"
         "👨‍💼 Администратор канала: @roman3801\n"
         "🤖 Создатель бота: @Woozinoid\n\n"
-        "⚠️ Посты выходят каждые 2.5 часа (сейчас 30 сек для теста).\n"
+        "⚠️ Посты выходят каждые 2.5 часа (сейчас 5 сек для теста).\n"
         "🚫 Мат запрещён!",
         parse_mode="HTML",
         reply_markup=main_keyboard()
@@ -257,11 +257,11 @@ async def suggest_prompt(message: types.Message):
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_text(message: types.Message):
-    # Игнорируем сообщения от каналов (sender_chat) и из каналов
+    # Игнорируем сообщения от каналов
     if message.sender_chat or message.chat.type == "channel":
         return
     user = message.from_user
-    if not user:  # если сообщение от анонимного канала
+    if not user:
         return
     uid = user.id
     if uid == 777000:  # Telegram
@@ -300,8 +300,11 @@ async def handle_text(message: types.Message):
     if corrected_text != original_text:
         await notify_admins(corrected_text, user, "✅ ИСПРАВЛЕНО")
 
-    author_name = f"@{user.username}" if user.username else user.first_name
-    post_text = f"{corrected_text}\n\n✍️ <i>Предложка: {author_name}</i>"
+    # Формируем пост БЕЗ автора, с кликабельной ссылкой на канал
+    post_text = (
+        f"{corrected_text}\n\n"
+        f"<a href='https://t.me/WoozinoidLife'>ИЩУ ТЕБЯ ЕКАТЕРИНБУРГ ПОДПИСЫВАЙТЕСЬ</a>"
+    )
 
     await post_queue.put({"text": post_text, "user_id": uid})
     queue_len = post_queue.qsize()
