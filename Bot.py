@@ -15,11 +15,12 @@ TOKEN = "8641527466:AAGSkaTzMJm5X6ExY3vVYRiMLxkwSxOOpnU"
 CHANNEL_ID = -1002313542500        # Канал для публикации
 ADMIN_GROUP_ID = -1002688386266    # Группа для просмотра предложки
 
-ADMIN_USERNAMES = ["Woozinoid", "HwangMinw"]  # Добавьте нужные юзернеймы
+ADMIN_USERNAMES = ["Woozinoid", "HwangMinw"]
 
 MOSCOW_TZ = timezone(timedelta(hours=3))
+EKAT_TZ = timezone(timedelta(hours=5))   # Екатеринбург
 
-PUBLISH_INTERVAL = 150 * 60  # 2.5 часа в секундах
+PUBLISH_INTERVAL = 5  # секунд (для теста, потом верните 150*60)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -27,57 +28,61 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 # ================= ПАМЯТЬ =================
-# Баны: {user_id: {"reason": str, "date": str, "banned_by": str}}
 banned_users = {}
-# Статистика за сегодня
 daily_stats = {"sent": 0, "rejected": 0, "date": None}
-# Очередь постов
 post_queue = asyncio.Queue()
-# Матерный фильтр (простой список, можно расширить)
+
 BAD_WORDS = [
     r"\b(ху(й|и|е|я|ё)|пизд(а|ы|е|у|ой)|еба(ть|л|н)|бля(дь|ть|д)|сук(а|и|ой)|залуп(а|ы|е)|жоп(а|ы|е)|гандон|мудак|пидор|лох)\b"
 ]
 BAD_WORDS_PATTERN = re.compile("|".join(BAD_WORDS), re.IGNORECASE)
 
-# ================= УТИЛИТЫ =================
 def is_admin(user: types.User) -> bool:
     if user.username is None:
         return False
     return user.username.lower() in [u.lower() for u in ADMIN_USERNAMES]
 
 def reset_daily_stats():
-    moscow_now = datetime.now(MOSCOW_TZ).date()
-    if daily_stats.get("date") != moscow_now:
+    ekat_now = datetime.now(EKAT_TZ).date()
+    if daily_stats.get("date") != ekat_now:
         daily_stats["sent"] = 0
         daily_stats["rejected"] = 0
-        daily_stats["date"] = moscow_now
+        daily_stats["date"] = ekat_now
 
-# ================= ПРОВЕРКА ГРАММАТИКИ =================
+# ================= ГЛАВНОЕ МЕНЮ =================
+def main_keyboard():
+    return types.ReplyKeyboardMarkup(
+        keyboard=[
+            [types.KeyboardButton(text="📊 Мой пост")],
+            [types.KeyboardButton(text="📨 Предложить новость")]
+        ],
+        resize_keyboard=True
+    )
+
+# ================= ПРОВЕРКА ГРАММАТИКИ (Яндекс.Спеллер) =================
 async def check_grammar(text: str) -> str:
-    url = "https://api.languagetool.org/v2/check"
-    data = {"text": text, "language": "ru", "enabledOnly": "false"}
+    url = "https://speller.yandex.net/services/spellservice.json/checkText"
+    params = {"text": text, "lang": "ru", "options": 0}
     try:
-        timeout = aiohttp.ClientTimeout(total=15)
+        timeout = aiohttp.ClientTimeout(total=10)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, data=data) as resp:
+            async with session.get(url, params=params) as resp:
                 result = await resp.json()
-        if not result.get("matches"):
+        if not result:
             return text
-        corrected = text
-        for match in sorted(result["matches"], key=lambda x: x["offset"], reverse=True):
-            if match.get("replacements"):
-                replacement = match["replacements"][0]["value"]
-                start = match["offset"]
-                end = start + match["length"]
-                corrected = corrected[:start] + replacement + corrected[end:]
-        return corrected
+        for error in sorted(result, key=lambda x: x["pos"] + x["len"], reverse=True):
+            if error["s"]:
+                replacement = error["s"][0]
+                start = error["pos"]
+                end = error["pos"] + error["len"]
+                text = text[:start] + replacement + text[end:]
+        return text
     except Exception as e:
-        logging.error(f"LanguageTool error: {e}")
+        logging.error(f"Yandex.Speller error: {e}")
         return text
 
-# ================= ПЕРЕСЫЛКА В ГРУППУ АДМИНА =================
+# ================= УВЕДОМЛЕНИЕ АДМИНАМ =================
 async def notify_admins(text: str, user: types.User = None, status: str = "📨 ПРЕДЛОЖКА"):
-    """Отправка уведомления в группу администраторов"""
     if user:
         author = f"@{user.username}" if user.username else user.first_name
         user_link = f"@{user.username}" if user.username else f"tg://user?id={user.id}"
@@ -90,13 +95,12 @@ async def notify_admins(text: str, user: types.User = None, status: str = "📨 
     except Exception as e:
         logging.error(f"Notify admins error: {e}")
 
-# ================= ФИЛЬТРАЦИЯ МАТА =================
+# ================= ПРОВЕРКА МАТА =================
 def contains_bad_words(text: str) -> bool:
     return bool(BAD_WORDS_PATTERN.search(text))
 
-# ================= ПУБЛИКАЦИЯ ИЗ ОЧЕРЕДИ =================
+# ================= ФОНОВАЯ ПУБЛИКАЦИЯ =================
 async def publisher():
-    """Фоновая задача: каждые PUBLISH_INTERVAL секунд публикует один пост из очереди"""
     while True:
         await asyncio.sleep(PUBLISH_INTERVAL)
         if post_queue.empty():
@@ -113,10 +117,9 @@ async def publisher():
             logging.info(f"Published post from {post_data.get('user_id', 'unknown')}")
         except Exception as e:
             logging.error(f"Publish error: {e}")
-            # Можно вернуть в очередь или уведомить админа
             await notify_admins(f"❌ Ошибка публикации: {e}\nПост: {post_data['text']}")
 
-# ================= ОБРАБОТЧИКИ КОМАНД (АДМИНКА) =================
+# ================= АДМИНСКИЕ КОМАНДЫ =================
 @dp.message(Command("ban"))
 async def cmd_ban(message: types.Message, command: CommandObject):
     if not is_admin(message.from_user):
@@ -134,7 +137,6 @@ async def cmd_ban(message: types.Message, command: CommandObject):
         "date": datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y %H:%M"),
         "banned_by": message.from_user.username or message.from_user.first_name
     }
-    # Уведомляем пользователя, если бот может ему написать
     try:
         await bot.send_message(
             chat_id=user_id,
@@ -196,23 +198,71 @@ async def cmd_stats(message: types.Message):
         parse_mode="HTML"
     )
 
-# ================= ОБРАБОТЧИКИ СООБЩЕНИЙ =================
+# ================= ОБРАБОТКА СООБЩЕНИЙ =================
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     await message.answer(
-        "📨 <b>Предложка новостей</b>\n\n"
-        "Отправьте мне текст, фото или видео — "
-        "я проверю грамматику и опубликую в канале.\n\n"
-        "⚠️ Посты выходят каждые 2.5 часа.\n"
+        "📨 <b>Добро пожаловать в предложку «Ищу тебя Екатеринбург»!</b>\n\n"
+        "Здесь вы можете отправить свою анкету или объявление, "
+        "которое после проверки грамматики будет опубликовано в канале.\n\n"
+        "👨‍💼 Администратор канала: @roman3801\n"
+        "🤖 Создатель бота: @Woozinoid\n\n"
+        "⚠️ Посты выходят каждые 2.5 часа (сейчас 5 сек для теста).\n"
         "🚫 Мат запрещён!",
+        parse_mode="HTML",
+        reply_markup=main_keyboard()
+    )
+
+@dp.message(F.text == "📊 Мой пост")
+async def my_post_status(message: types.Message):
+    uid = message.from_user.id
+    # Ищем пост пользователя в очереди
+    found_position = None
+    for idx, item in enumerate(post_queue._queue):
+        if item.get("user_id") == uid:
+            found_position = idx + 1  # позиция (1 – первый)
+            break
+    if found_position is None:
+        await message.answer("❌ У вас нет постов в очереди.")
+        return
+
+    remaining_seconds = found_position * PUBLISH_INTERVAL
+    # Переводим в дни/часы/минуты
+    days = remaining_seconds // 86400
+    hours = (remaining_seconds % 86400) // 3600
+    minutes = (remaining_seconds % 3600) // 60
+    seconds = remaining_seconds % 60
+
+    # Время публикации по Екатеринбургу
+    publish_time = datetime.now(EKAT_TZ) + timedelta(seconds=remaining_seconds)
+    time_str = publish_time.strftime("%d.%m.%Y %H:%M")
+
+    # Собираем ответ
+    parts = []
+    if days: parts.append(f"{days} дн")
+    if hours: parts.append(f"{hours} ч")
+    if minutes: parts.append(f"{minutes} мин")
+    if seconds or not parts: parts.append(f"{seconds} сек")
+    duration_str = " ".join(parts)
+
+    await message.answer(
+        f"📊 Ваш пост находится на позиции <b>{found_position}</b>\n"
+        f"⏳ До публикации осталось: {duration_str}\n"
+        f"🕒 Будет опубликован (Екб): {time_str}",
         parse_mode="HTML"
+    )
+
+@dp.message(F.text == "📨 Предложить новость")
+async def suggest_prompt(message: types.Message):
+    await message.answer(
+        "✏️ Просто отправьте текст (или фото/видео с подписью) — "
+        "я проверю грамматику и поставлю в очередь на публикацию."
     )
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_text(message: types.Message):
     user = message.from_user
     uid = user.id
-    # Проверка бана
     if uid in banned_users:
         ban_data = banned_users[uid]
         await message.answer(
@@ -225,10 +275,12 @@ async def handle_text(message: types.Message):
         return
 
     original_text = message.text
-    # Уведомление админам (оригинал)
+    # Игнорируем команды, которые уже обработаны (кнопки)
+    if original_text in ["📊 Мой пост", "📨 Предложить новость"]:
+        return
+
     await notify_admins(original_text, user, "📨 ПРЕДЛОЖКА")
 
-    # Проверка мата
     if contains_bad_words(original_text):
         reset_daily_stats()
         daily_stats["rejected"] += 1
@@ -240,38 +292,31 @@ async def handle_text(message: types.Message):
         await notify_admins(original_text, user, "❌ ОТКЛОНЕНО (мат)")
         return
 
-    # Проверка грамматики
     status_msg = await message.answer("🔍 Проверяю грамматику...")
     corrected_text = await check_grammar(original_text)
     if corrected_text != original_text:
         await notify_admins(corrected_text, user, "✅ ИСПРАВЛЕНО")
 
-    # Формируем пост с подписью автора
     author_name = f"@{user.username}" if user.username else user.first_name
     post_text = f"{corrected_text}\n\n✍️ <i>Предложка: {author_name}</i>"
 
-    # Добавляем в очередь
     await post_queue.put({"text": post_text, "user_id": uid})
     queue_len = post_queue.qsize()
-    approx_time = datetime.now(MOSCOW_TZ) + timedelta(seconds=PUBLISH_INTERVAL * queue_len)
+    approx_time = datetime.now(EKAT_TZ) + timedelta(seconds=PUBLISH_INTERVAL * queue_len)
     time_str = approx_time.strftime("%H:%M")
     await status_msg.edit_text(
         f"✅ <b>Пост принят!</b>\n"
-        f"⏳ Будет опубликован примерно в {time_str} (МСК)\n"
+        f"⏳ Будет опубликован примерно в {time_str} (Екб)\n"
         f"📌 Позиция в очереди: {queue_len}",
         parse_mode="HTML"
     )
-
-# Аналогично для фото и видео (можно добавить, но оставим только текст для примера)
 
 # ================= ВЕБ-СЕРВЕР =================
 async def home(request):
     return web.Response(text="Bot is running")
 
 async def main():
-    # Запускаем фонового издателя
     asyncio.create_task(publisher())
-    # Веб-сервер
     app = web.Application()
     app.router.add_get("/", home)
     runner = web.AppRunner(app)
@@ -280,7 +325,7 @@ async def main():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     logging.info(f"Web server started on port {port}")
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, drop_pending_updates=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
