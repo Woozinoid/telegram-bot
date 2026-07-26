@@ -20,7 +20,7 @@ ADMIN_USERNAMES = ["Woozinoid", "HwangMinw"]
 MOSCOW_TZ = timezone(timedelta(hours=3))
 EKAT_TZ = timezone(timedelta(hours=5))   # Екатеринбург
 
-PUBLISH_INTERVAL = 5  # секунд (для теста, потом верните 150*60)
+PUBLISH_INTERVAL = 30  # секунд (для теста, потом замените на 150*60)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -207,7 +207,7 @@ async def start_cmd(message: types.Message):
         "которое после проверки грамматики будет опубликовано в канале.\n\n"
         "👨‍💼 Администратор канала: @roman3801\n"
         "🤖 Создатель бота: @Woozinoid\n\n"
-        "⚠️ Посты выходят каждые 2.5 часа (сейчас 5 сек для теста).\n"
+        "⚠️ Посты выходят каждые 2.5 часа (сейчас 30 сек для теста).\n"
         "🚫 Мат запрещён!",
         parse_mode="HTML",
         reply_markup=main_keyboard()
@@ -216,28 +216,24 @@ async def start_cmd(message: types.Message):
 @dp.message(F.text == "📊 Мой пост")
 async def my_post_status(message: types.Message):
     uid = message.from_user.id
-    # Ищем пост пользователя в очереди
     found_position = None
     for idx, item in enumerate(post_queue._queue):
         if item.get("user_id") == uid:
-            found_position = idx + 1  # позиция (1 – первый)
+            found_position = idx + 1
             break
     if found_position is None:
         await message.answer("❌ У вас нет постов в очереди.")
         return
 
     remaining_seconds = found_position * PUBLISH_INTERVAL
-    # Переводим в дни/часы/минуты
     days = remaining_seconds // 86400
     hours = (remaining_seconds % 86400) // 3600
     minutes = (remaining_seconds % 3600) // 60
     seconds = remaining_seconds % 60
 
-    # Время публикации по Екатеринбургу
     publish_time = datetime.now(EKAT_TZ) + timedelta(seconds=remaining_seconds)
     time_str = publish_time.strftime("%d.%m.%Y %H:%M")
 
-    # Собираем ответ
     parts = []
     if days: parts.append(f"{days} дн")
     if hours: parts.append(f"{hours} ч")
@@ -261,8 +257,16 @@ async def suggest_prompt(message: types.Message):
 
 @dp.message(F.text & ~F.text.startswith("/"))
 async def handle_text(message: types.Message):
+    # Игнорируем сообщения от каналов (sender_chat) и из каналов
+    if message.sender_chat or message.chat.type == "channel":
+        return
     user = message.from_user
+    if not user:  # если сообщение от анонимного канала
+        return
     uid = user.id
+    if uid == 777000:  # Telegram
+        return
+
     if uid in banned_users:
         ban_data = banned_users[uid]
         await message.answer(
@@ -275,7 +279,6 @@ async def handle_text(message: types.Message):
         return
 
     original_text = message.text
-    # Игнорируем команды, которые уже обработаны (кнопки)
     if original_text in ["📊 Мой пост", "📨 Предложить новость"]:
         return
 
