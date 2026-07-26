@@ -15,12 +15,12 @@ TOKEN = "8641527466:AAGSkaTzMJm5X6ExY3vVYRiMLxkwSxOOpnU"
 CHANNEL_ID = -1002313542500        # Канал для публикации
 ADMIN_GROUP_ID = -1002688386266    # Группа для просмотра предложки
 
-ADMIN_USERNAMES = ["Woozinoid", "HwangMinw"]
+ADMIN_USERNAMES = ["Woozinoid", "roman3801", "durovgar"]  # без @
 
 MOSCOW_TZ = timezone(timedelta(hours=3))
 EKAT_TZ = timezone(timedelta(hours=5))   # Екатеринбург
 
-PUBLISH_INTERVAL = 10 #секунд (для теста, после теста замените на 150*60)
+PUBLISH_INTERVAL = 10 # 2.5 часа
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
@@ -28,12 +28,23 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 # ================= ПАМЯТЬ =================
-banned_users = {}
+banned_users = {}       # {user_id: {"reason": str, "date": str, "banned_by": str}}
+# Кэш username -> user_id (заполняется при бане по юзернейму)
+username_cache = {}     # {username_lower: user_id}
+
 daily_stats = {"sent": 0, "rejected": 0, "date": None}
 post_queue = asyncio.Queue()
 
+# ================= РАСШИРЕННЫЙ МАТ-ФИЛЬТР =================
 BAD_WORDS = [
-    r"\b(ху(й|и|е|я|ё)|пизд(а|ы|е|у|ой)|еба(ть|л|н)|бля(дь|ть|д)|сук(а|и|ой)|залуп(а|ы|е)|жоп(а|ы|е)|гандон|мудак|пидор|лох)\b"
+    r"\b(ху(й|и|е|я|ё|л[оёе]|йн[её]й|йло|ли)\b)",
+    r"\b(пизд(а|ы|е|у|ой|юк|юл[её]й|обол|острад)\b)",
+    r"\b(еба(ть|л|н|ло|нут|льник|нёт)\b)",
+    r"\b(бля(дь|ть|д|дина|дство|дский|дки)\b)",
+    r"\b(сук(а|и|ой|ин|чка|чька|чьку)\b)",
+    r"\b(залуп(а|ы|е|ой|ушка)\b)",
+    r"\b(жоп(а|ы|е|ой|ушка|олиз)\b)",
+    r"\b(гандон|мудак|пидор|пидр|пидрила|лох|лошара|у(е|ё)бок|у(е|ё)бище|мразь|тварь|сволочь|гнида|падла|шлюха|проститутка|гомик|лезбиянка|трахать|трах|отсос|минет|ахуеть|ахуенно|охуеть|нихуя|нихера|похер|пофиг)\b"
 ]
 BAD_WORDS_PATTERN = re.compile("|".join(BAD_WORDS), re.IGNORECASE)
 
@@ -111,7 +122,7 @@ async def publisher():
                 chat_id=CHANNEL_ID,
                 text=post_data["text"],
                 parse_mode="HTML",
-                disable_web_page_preview=True   # ← отключаем превью
+                disable_web_page_preview=True
             )
             reset_daily_stats()
             daily_stats["sent"] += 1
@@ -127,17 +138,36 @@ async def cmd_ban(message: types.Message, command: CommandObject):
         return await message.reply("⛔ Нет доступа")
     args = command.args
     if not args:
-        return await message.reply("Использование: /ban <user_id> <причина>")
+        return await message.reply("Использование: /ban @username причина или /ban user_id причина")
     parts = args.split(maxsplit=1)
-    if not parts[0].isdigit():
-        return await message.reply("Укажите числовой ID пользователя")
-    user_id = int(parts[0])
+    target = parts[0]
     reason = parts[1] if len(parts) > 1 else "Без причины"
+
+    # Определяем, user_id или @username
+    user_id = None
+    if target.startswith("@"):
+        username = target[1:].lower()  # убираем @ и приводим к нижнему регистру
+        # Ищем в кэше или пытаемся получить через API
+        if username in username_cache:
+            user_id = username_cache[username]
+        else:
+            # Пытаемся найти пользователя (но для этого бот должен с ним взаимодействовать)
+            await message.reply("Для бана по юзернейму пользователь должен сначала написать боту. Если он писал, попробуйте /banid <user_id> причина")
+            return
+    elif target.isdigit():
+        user_id = int(target)
+    else:
+        return await message.reply("Укажите @username или числовой ID")
+
     banned_users[user_id] = {
         "reason": reason,
         "date": datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y %H:%M"),
         "banned_by": message.from_user.username or message.from_user.first_name
     }
+    # Обновляем кэш, если был username
+    if target.startswith("@"):
+        username_cache[target[1:].lower()] = user_id
+
     try:
         await bot.send_message(
             chat_id=user_id,
@@ -206,9 +236,9 @@ async def start_cmd(message: types.Message):
         "📨 <b>Добро пожаловать в предложку «Ищу тебя Екатеринбург»!</b>\n\n"
         "Здесь вы можете отправить свою анкету или объявление, "
         "которое после проверки грамматики будет опубликовано в канале.\n\n"
-        "👨‍💼 Администратор канала: @roman3801\n"
+        "👨‍💼 Создатели канала: @Woozinoid и @roman3801\n"
         "🤖 Создатель бота: @Woozinoid\n\n"
-        "⚠️ Посты выходят каждые 2.5 часа (сейчас 5 сек для теста).\n"
+        "⚠️ Посты выходят каждые 2.5 часа.\n"
         "🚫 Мат запрещён!",
         parse_mode="HTML",
         reply_markup=main_keyboard()
@@ -264,6 +294,11 @@ async def handle_text(message: types.Message):
     if not user:
         return
     uid = user.id
+
+    # Сохраняем username в кэш для бана по юзернейму
+    if user.username:
+        username_cache[user.username.lower()] = uid
+
     if uid == 777000:
         return
 
