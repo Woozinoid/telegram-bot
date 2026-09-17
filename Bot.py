@@ -4,7 +4,7 @@ import logging
 import asyncio
 import aiosqlite
 import re
-from datetime import datetime, timedelta, timezone
+import time
 from html import escape
 from typing import Callable, Dict, Any, Awaitable
 from aiohttp import web
@@ -13,531 +13,568 @@ from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
-from aiogram.types import (
-    Message, TelegramObject, InlineKeyboardMarkup,
-    InlineKeyboardButton, ChatPermissions
-)
+from aiogram.types import Message, TelegramObject, ChatPermissions
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiogram.exceptions import TelegramAPIError
 
-# ================= КОНФИГУРАЦИЯ =================
+# ================= КОНФИГ =================
 BOT_TOKEN = "8823945629:AAHfN3LN7lFahjV7kSC5I8f8SXfM4mvCbKQ"
 WEBHOOK_URL = "https://telegram-bot-qxtd.onrender.com/webhook"
 PORT = int(os.getenv("PORT", 8080))
 WEBHOOK_PATH = "/webhook"
 
-# ================= РЕГУЛЯРНЫЕ ВЫРАЖЕНИЯ =================
-BAN_PATTERN     = re.compile(r"^(?:/|!)?(?:бан|ban)\b", re.IGNORECASE)
-UNBAN_PATTERN   = re.compile(r"^(?:/|!)?(?:разбан|unban)\b", re.IGNORECASE)
-KICK_PATTERN    = re.compile(r"^(?:/|!)?(?:кик|kick)\b", re.IGNORECASE)
-MUTE_PATTERN    = re.compile(r"^(?:/|!)?(?:мут|mute)\b", re.IGNORECASE)
-UNMUTE_PATTERN  = re.compile(r"^(?:/|!)?(?:размут|unmute)\b", re.IGNORECASE)
-WARN_PATTERN    = re.compile(r"^(?:/|!)?(?:варн|warn)\b", re.IGNORECASE)
-UNWARN_PATTERN  = re.compile(r"^(?:/|!)?(?:-варн|снять варн|unwarn)\b", re.IGNORECASE)
-ADMINS_PATTERN  = re.compile(r"^(?:кто админ|админы|/admins)\b", re.IGNORECASE)
-BANLIST_PATTERN = re.compile(r"^(?:бан лист|банлист|/banlist)\b", re.IGNORECASE)
+# Кто может пользоваться ботом (без @)
+ALLOWED_USERNAMES = ["Woozinoid", "roman3801", "durovgar"]
+
+# Кто может назначать ранги
+MAIN_ADMINS = ["Woozinoid"]
+
+RANK_MAX = 3
+RANK_STARS = {1: "⭐️", 2: "⭐️⭐️", 3: "⭐️⭐️⭐️"}
+
+# ================= ПАРСЕР ПЕРИОДА =================
+UNITS = [
+    ("месяц", 2592000), ("мес", 2592000),
+    ("недел", 604800), ("нед", 604800),
+    ("день", 86400), ("дня", 86400), ("дней", 86400), ("д", 86400),
+    ("час", 3600), ("часа", 3600), ("часов", 3600), ("ч", 3600),
+    ("минут", 60), ("мин", 60), ("м", 60),
+    ("секунд", 1), ("сек", 1), ("с", 1),
+]
+
+def parse_period(s: str):
+    if not s:
+        return None
+    m = re.match(r"^(\d+)\s*([а-яa-z]+)\.?$", s.strip().lower())
+    if not m:
+        return None
+    n, u = int(m.group(1)), m.group(2)
+    for key, secs in UNITS:
+        if u.startswith(key):
+            return n * secs
+    return None
+
+def fmt_period(s: int) -> str:
+    if s >= 2592000: return f"{s // 2592000} мес."
+    if s >= 604800:  return f"{s // 604800} нед."
+    if s >= 86400:   return f"{s // 86400} дн."
+    if s >= 3600:    return f"{s // 3600} ч."
+    if s >= 60:      return f"{s // 60} мин."
+    return f"{s} сек."
 
 # ================= БАЗА ДАННЫХ =================
 async def init_db():
     async with aiosqlite.connect("bot.db") as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS bans (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                chat_id INTEGER,
-                admin_id INTEGER,
-                target_name TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                full_name TEXT
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS warns (
-                user_id INTEGER,
-                chat_id INTEGER,
-                count INTEGER DEFAULT 0,
-                PRIMARY KEY (user_id, chat_id)
-            )
-        """)
+        await db.execute("""CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT)""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS ranks (
+            user_id INTEGER PRIMARY KEY, rank INTEGER DEFAULT 0)""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS warns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER, chat_id INTEGER, reason TEXT,
+            warned_by INTEGER, warned_at INTEGER)""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS bans (
+            user_id INTEGER, chat_id INTEGER, until INTEGER,
+            reason TEXT, banned_by INTEGER,
+            PRIMARY KEY (user_id, chat_id))""")
         await db.commit()
 
-# ================= MIDDLEWARE КЭША ПОЛЬЗОВАТЕЛЕЙ =================
-class UserCacheMiddleware(BaseMiddleware):
-    async def __call__(
-        self,
-        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
-        event: TelegramObject,
-        data: Dict[str, Any]
-    ) -> Any:
+async def save_user(uid: int, username: str, full_name: str):
+    async with aiosqlite.connect("bot.db") as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO users (user_id, username, full_name) VALUES (?, ?, ?)",
+            (uid, username, full_name))
+        await db.commit()
+
+async def get_username(uid: int):
+    async with aiosqlite.connect("bot.db") as db:
+        cur = await db.execute("SELECT username FROM users WHERE user_id=?", (uid,))
+        r = await cur.fetchone()
+        return r[0] if r else None
+
+async def get_display_name(uid: int) -> str:
+    async with aiosqlite.connect("bot.db") as db:
+        cur = await db.execute("SELECT username, full_name FROM users WHERE user_id=?", (uid,))
+        r = await cur.fetchone()
+        if r:
+            return f"@{r[0]}" if r[0] else (r[1] or str(uid))
+    return str(uid)
+
+async def get_rank(uid: int) -> int:
+    async with aiosqlite.connect("bot.db") as db:
+        cur = await db.execute("SELECT rank FROM ranks WHERE user_id=?", (uid,))
+        r = await cur.fetchone()
+        return r[0] if r else 0
+
+async def set_rank(uid: int, rank: int):
+    async with aiosqlite.connect("bot.db") as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO ranks (user_id, rank) VALUES (?, ?)",
+            (uid, rank))
+        await db.commit()
+
+async def find_uid_by_username(username: str):
+    async with aiosqlite.connect("bot.db") as db:
+        cur = await db.execute(
+            "SELECT user_id FROM users WHERE username=? COLLATE NOCASE",
+            (username,))
+        r = await cur.fetchone()
+        return r[0] if r else    None
+
+async def add async with aios_warn(uid: int, chat_id: int, reason: str, by_id: int) -> int:
+qlite.connect("bot.db") as db:
+        await db.execute(
+            "INSERT INTO warns (user_id, chat_id, reason, warned_by, warned_at) VALUES (?, ?, ?, ?, ?)",
+            (uid, chat_id, reason, by_id, int(time.time())))
+        await db.commit()
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM warns WHERE user_id=? AND chat_id=?",
+            (uid, chat_id))
+        return (await cur.fetchone())[0]
+
+async def clear_warns(uid: int, chat_id: int, count: int = None):
+    async with aiosqlite.connect("bot.db") as db:
+        if count is None:
+            await db.execute("DELETE FROM warns WHERE user_id=? AND chat_id=?", (uid, chat_id))
+        else:
+            await db.execute("""DELETE FROM warns WHERE id IN (
+                SELECT id FROM warns WHERE user_id=? AND chat_id=? ORDER BY id DESC LIMIT ?
+            )""", (uid, chat_id, count))
+        await db.commit()
+
+async def add_ban(uid: int, chat_id: int, until: int, reason: str, by_id: int):
+    async with aiosqlite.connect("bot.db") as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO bans (user_id, chat_id, until, reason, banned_by) VALUES (?, ?, ?, ?, ?)",
+            (uid, chat_id, until, reason, by_id))
+        await db.commit()
+
+async def remove_ban(uid: int, chat_id: int):
+    async with aiosqlite.connect("bot.db") as db:
+        await db.execute("DELETE FROM bans WHERE user_id=? AND chat_id=?", (uid, chat_id))
+        await db.commit()
+
+async def get_banlist(chat_id: int) -> list:
+    async with aiosqlite.connect("bot.db") as db:
+        cur = await db.execute(
+            "SELECT user_id, reason FROM bans WHERE chat_id=? ORDER BY rowid DESC LIMIT 20",
+            (chat_id,))
+        return await cur.fetchall()
+
+# ================= КЭШ ПОЛЬЗОВАТЕЛЕЙ =================
+class UserCache(BaseMiddleware):
+    async def __call__(self, handler, event: TelegramObject, data: Dict[str, Any]):
         user = data.get("event_from_user")
-        if user:
-            async with aiosqlite.connect("bot.db") as db:
-                await db.execute(
-                    "INSERT OR REPLACE INTO users (user_id, username, full_name) VALUES (?, ?, ?)",
-                    (user.id, user.username, user.full_name)
-                )
-                await db.commit()
+        if user and user.username:
+            await save_user(user.id, user.username, user.full_name)
         return await handler(event, data)
 
-# ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =================
-async def get_user_from_args(args: str) -> tuple[int, str] | None:
-    if not args:
-        return None
-    arg = args.strip()
-    if arg.isdigit():
-        return int(arg), f"ID: {arg}"
-    if arg.startswith("@"):
-        username = arg[1:]
-        async with aiosqlite.connect("bot.db") as db:
-            async with db.execute(
-                "SELECT user_id, full_name FROM users WHERE username = ? COLLATE NOCASE",
-                (username,)
-            ) as cursor:
-                row = await cursor.fetchone()
-                if row:
-                    return row[0], row[1]
-    return None
+# ================= ПРАВА =================
+def is_allowed(username: str) -> bool:
+    if not username:
+        return False
+    return username.lower() in [u.lower() for u in ALLOWED_USERNAMES]
 
+def is_main_admin(username: str) -> bool:
+    if not username:
+        return False
+    return username.lower() in [u.lower() for u in MAIN_ADMINS]
 
-async def check_admin_rights(
-    message: Message,
-    bot: Bot,
-    target_id: int | None = None,
-    check_target: bool = True,
-    need_restrict: bool = False,
-) -> bool:
-    try:
-        bot_member = await message.chat.get_member(bot.id)
-        if bot_member.status not in ("administrator", "creator"):
-            await message.reply("❌ У меня нет прав администратора в этом чате.")
-            return False
-        if need_restrict and not getattr(bot_member, "can_restrict_members", False):
-            await message.reply("❌ У меня нет права ограничивать участников.")
-            return False
+async def check_actor(message: Message) -> bool:
+    """Является ли отправитель разрешённым."""
+    u = message.from_user
+    if not u or not is_allowed(u.username):
+        return False
+    # Автоматически даём ранг 1, если его нет
+    if await get_rank(u.id) == 0 and not is_main_admin(u.username):
+        await set_rank(u.id, 1)
+    return True
 
-        user_member = await message.chat.get_member(message.from_user.id)
-        if user_member.status not in ("administrator", "creator"):
-            await message.reply("⛔ Эта команда доступна только администраторам.")
-            return False
+async def get_actor_rank(message: Message) -> int:
+    if is_main_admin(message.from_user.username):
+        return RANK_MAX
+    return await get_rank(message.from_user.id)
 
-        if check_target and target_id:
-            try:
-                target_member = await message.chat.get_member(target_id)
-                if target_member.status in ("administrator", "creator"):
-                    await message.reply("⚠️ Нельзя применить это к администратору.")
-                    return False
-            except TelegramAPIError:
-                pass
+async def check_target(message: Message, target_uid: int) -> tuple[bool, str]:
+    """Можно ли действовать против цели."""
+    if target_uid == message.from_user.id:
+        return False, "🤔 На себя нельзя."
+    if target_uid == message.bot.id:
+        return False, "🤖 На меня нельзя."
 
-        return True
-    except TelegramAPIError as e:
-        logging.warning(f"Ошибка проверки прав: {e}")
-        return True
+    actor_rank = await get_actor_rank(message)
+    target_uname = await get_username(target_uid)
+    target_rank = await get_rank(target_uid)
 
+    # Цель защищена, если она в ALLOWED и её ранг >= ранг актора
+    if is_allowed(target_uname) and target_rank >= actor_rank:
+        return False, "🔒 Пользователь защищён рангом."
+    return True, ""
 
-async def resolve_target(message: Message, args: str) -> tuple[int, str] | tuple[None, None]:
+# ================= ВСПОМОГАТЕЛЬНОЕ =================
+async def resolve_target(message: Message, args: str):
+    """(uid, name) по реплаю / @username / ID."""
     if message.reply_to_message and message.reply_to_message.from_user:
-        return (
-            message.reply_to_message.from_user.id,
-            message.reply_to_message.from_user.full_name,
-        )
-    elif args:
-        user_data = await get_user_from_args(args)
-        if user_data:
-            return user_data[0], user_data[1]
+        u = message.reply_to_message.from_user
+        await save_user(u.id, u.username or "", u.full_name)
+        return u.id, escape(u.full_name)
+    if args:
+        arg = args.strip().split()[0]
+        if arg.isdigit():
+            uid = int(arg)
+            return uid, escape(await get_display_name(uid))
+        if arg.startswith("@"):
+            uid = await find_uid_by_username(arg[1:])
+            if uid:
+                return uid, escape(await get_display_name(uid))
     return None, None
 
-
-def full_mute_permissions() -> ChatPermissions:
+def full_mute_perms() -> ChatPermissions:
     return ChatPermissions(
-        can_send_messages=False,
-        can_send_audios=False,
-        can_send_documents=False,
-        can_send_photos=False,
-        can_send_videos=False,
-        can_send_video_notes=False,
-        can_send_voice_notes=False,
-        can_send_polls=False,
-        can_send_other_messages=False,
-        can_add_web_page_previews=False,
+        can_send_messages=False, can_send_audios=False,
+        can_send_documents=False, can_send_photos=False,
+        can_send_videos=False, can_send_video_notes=False,
+        can_send_voice_notes=False, can_send_polls=False,
+        can_send_other_messages=False, can_add_web_page_previews=False,
     )
 
-
-def full_unmute_permissions() -> ChatPermissions:
+def full_unmute_perms() -> ChatPermissions:
     return ChatPermissions(
-        can_send_messages=True,
-        can_send_audios=True,
-        can_send_documents=True,
-        can_send_photos=True,
-        can_send_videos=True,
-        can_send_video_notes=True,
-        can_send_voice_notes=True,
-        can_send_polls=True,
-        can_send_other_messages=True,
-        can_add_web_page_previews=True,
+        can_send_messages=True, can_send_audios=True,
+        can_send_documents=True, can_send_photos=True,
+        can_send_videos=True, can_send_video_notes=True,
+        can_send_voice_notes=True, can_send_polls=True,
+        can_send_other_messages=True, can_add_web_page_previews=True,
     )
 
 # ================= РОУТЕРЫ =================
 pm_router = Router()
 pm_router.message.filter(F.chat.type == "private")
-
 group_router = Router()
 group_router.message.filter(F.chat.type.in_({"group", "supergroup"}))
 
-# ================= ЛИЧКА =================
 @pm_router.message(CommandStart())
-async def cmd_start_pm(message: Message, bot: Bot):
+async def start_pm(message: Message, bot: Bot):
     me = await bot.get_me()
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(
-            text="➕ Добавить в свою группу",
-            url=f"https://t.me/{me.username}?startgroup=true"
-        )
-    ]])
     await message.answer(
-        f"Привет, <b>{escape(message.from_user.first_name)}</b>! 👋\n\n"
-        "Я — бот-менеджер для защиты ваших чатов.\n"
-        "Добавь меня в свою группу и назначь администратором.",
-        reply_markup=kb
+        f"👋 <b>Привет, {escape(message.from_user.first_name)}!</b>\n\n"
+        f"Я — модератор-бот с ранговой системой.\n\n"
+        f"<b>Доступные команды:</b>\n"
+        f"🔨 <code>бан [срок] @user</code>\n"
+        f"🔇 <code>мут [срок] @user</code>\n"
+        f"👞 <code>кик @user</code>\n"
+        f"⚠️ <code>варн @user</code>\n"
+        f"➕ <code>+модер 1|2|3 @user</code> — назначить ранг\n"
+        f"➖ <code>-модер @user</code> — снять ранг\n\n"
+        f"<i>Срок указывается так: <code>бан 2ч @user</code>, <code>мут 3 дня @user</code></i>"
     )
 
-# ================= ИНФОРМАЦИОННЫЕ КОМАНДЫ =================
-@group_router.message(F.text.regexp(ADMINS_PATTERN))
-async def cmd_admins(message: Message, bot: Bot):
+# ================= +МОДЕР =================
+SETRANK_PATTERN = re.compile(r"^\+модер\s+(\d+)\b", re.IGNORECASE)
+UNRANK_PATTERN = re.compile(r"^(?:-модер|снять модер)\b", re.IGNORECASE)
+
+@group_router.message(F.text.regexp(SETRANK_PATTERN))
+async def cmd_set_rank(message: Message, bot: Bot):
+    if not await check_actor(message):
+        return
+    if not is_main_admin(message.from_user.username):
+        return await message.reply("⛔ Назначать ранги может только создатель.")
+    m = SETRANK_PATTERN.match(message.text)
+    rank = int(m.group(1))
+    if rank < 1 or rank > RANK_MAX:
+        return await message.reply(f"❌ Ранг от 1 до {RANK_MAX}.")
+    rest = SETRANK_PATTERN.sub("", message.text, count=1).strip()
+    uid, name = await resolve_target(message, rest)
+    if not uid:
+        return await message.reply("🔍 Укажи @username, ID или ответь на сообщение.")
+    await set_rank(uid, rank)
+    await message.answer(
+        f"{RANK_STARS[rank]} <b>{name}</b> — ранг <b>{rank}</b> установлен."
+    )
+
+@group_router.message(F.text.regexp(UNRANK_PATTERN))
+async def cmd_unrank(message: Message, bot: Bot):
+    if not await check_actor(message):
+        return
+    if not is_main_admin(message.from_user.username):
+        return await message.reply("⛔ Только создатель.")
+    rest = UNRANK_PATTERN.sub("", message.text, count=1).strip()
+    uid, name = await resolve_target(message, rest)
+    if not uid:
+        return await message.reply("🔍 Кого?")
+    await set_rank(uid, 0)
+    await message.answer(f"❌ {name} лишён ранга.")
+
+# ================= БАН =================
+BAN_PATTERN = re.compile(r"^(?:/|!)?бан\b", re.IGNORECASE)
+UNBAN_PATTERN = re.compile(r"^(?:разбан|unban)\b", re.IGNORECASE)
+BANLIST_PATTERN = re.compile(r"^банлист\b", re.IGNORECASE)
+
+@group_router.message(F.text.regexp(BAN_PATTERN))
+async def cmd_ban(message: Message, bot: Bot):
+    if not await check_actor(message):
+        return
+    rest = BAN_PATTERN.sub("", message.text, count=1).strip()
+    lines = rest.split("\n", 1)
+    first = lines[0].strip()
+    reason = lines[1].strip() if len(lines) > 1 else "Без причины"
+
+    # Период (необязательный)
+    period = None
+    parts = first.split(maxsplit=1)
+    if parts and parse_period(parts[0]):
+        period = parse_period(parts[0])
+        target_arg = parts[1] if len(parts) > 1 else ""
+    else:
+        target_arg = first
+
+    uid, name = await resolve_target(message, target_arg)
+    if not uid:
+        return await message.reply("🔍 Кого банить? Укажи @username или ответь.")
+
+    ok, err = await check_target(message, uid)
+    if not ok:
+        return await message.reply(err)
+
+    until = int(time.time()) + period if period else 0
     try:
-        admins = await bot.get_chat_administrators(message.chat.id)
-        creators, senior_admins = [], []
+        await bot.ban_chat_member(message.chat.id, uid)
+        await add_ban(uid, message.chat.id, until, reason, message.from_user.id)
+        mod_name = escape(message.from_user.full_name)
+        await message.answer(
+            f"🔨 <b>{name}</b> забанен\n"
+            f"📝 Причина: <i>{escape(reason)}</i>\n"
+            f"⏳ Срок: <b>{fmt_period(period) if period else 'навсегда'}</b>\n"
+            f"👤 Модератор: {mod_name}"
+        )
+    except TelegramAPIError as e:
+        logging.error(f"ban: {e}")
+        await message.reply("❌ Не удалось. Возможно, цель — создатель или у меня нет прав.")
 
-        for admin in admins:
-            if admin.user.is_bot:
-                continue
-            name = f"🏐 <a href='tg://user?id={admin.user.id}'>{escape(admin.user.full_name)}</a>"
-            if admin.status == "creator":
-                creators.append(name)
-            else:
-                senior_admins.append(name)
-
-        text = ""
-        if creators:
-            text += "⭐️⭐️⭐️⭐️ <b>Создатели</b>\n" + "\n".join(creators) + "\n\n"
-        if senior_admins:
-            text += "⭐️⭐️⭐️ <b>Админы</b>\n" + "\n".join(senior_admins)
-        if not text:
-            text = "Администраторов не найдено (или они скрыты)."
-
-        await message.answer(text)
+@group_router.message(F.text.regexp(UNBAN_PATTERN))
+async def cmd_unban(message: Message, bot: Bot):
+    if not await check_actor(message):
+        return
+    rest = UNBAN_PATTERN.sub("", message.text, count=1).strip()
+    uid, name = await resolve_target(message, rest)
+    if not uid:
+        return await message.reply("🔍 Кого?")
+    try:
+        await bot.unban_chat_member(message.chat.id, uid, only_if_banned=True)
+        await remove_ban(uid, message.chat.id)
+        await message.answer(f"✅ <b>{name}</b> разбанен.")
     except TelegramAPIError:
-        await message.reply("❌ Ошибка при получении списка администраторов.")
-
+        await message.reply("❌ Не удалось.")
 
 @group_router.message(F.text.regexp(BANLIST_PATTERN))
 async def cmd_banlist(message: Message):
-    async with aiosqlite.connect("bot.db") as db:
-        async with db.execute(
-            "SELECT target_name FROM bans WHERE chat_id = ? ORDER BY id DESC LIMIT 15",
-            (message.chat.id,)
-        ) as cursor:
-            bans = await cursor.fetchall()
-
-    if not bans:
-        return await message.reply("📭 Бан-лист этого чата пуст.")
-
-    text = "📋 <b>Последние забаненные:</b>\n\n"
-    for idx, (name,) in enumerate(bans, 1):
-        text += f"{idx}. <b>{escape(name)}</b>\n"
-
+    if not await check_actor(message):
+        return
+    rows = await get_banlist(message.chat.id)
+    if not rows:
+        return await message.reply("📭 Банлист пуст.")
+    text = "📋 <b>Забаненные:</b>\n\n"
+    for i, (uid, reason) in enumerate(rows, 1):
+        text += f"{i}. {escape(await get_display_name(uid))} — <i>{escape(reason or '—')}</i>\n"
     await message.answer(text)
 
-# ================= БАН =================
-@group_router.message(F.text.regexp(BAN_PATTERN))
-async def cmd_ban_text(message: Message, bot: Bot):
-    args = BAN_PATTERN.sub("", message.text, count=1).strip()
-    target_id, target_name = await resolve_target(message, args)
-
-    if not target_id:
-        return await message.reply(
-            "🔍 Пользователь не найден. Ответьте на сообщение или укажите @username / ID."
-        )
-    if target_id == bot.id:
-        return await message.reply("Я не могу заблокировать сам себя.")
-    if not await check_admin_rights(message, bot, target_id):
-        return
-
-    target_name = escape(target_name)
-    moderator = escape(message.from_user.full_name)
-
-    try:
-        await bot.ban_chat_member(chat_id=message.chat.id, user_id=target_id)
-        async with aiosqlite.connect("bot.db") as db:
-            await db.execute(
-                "INSERT INTO bans (user_id, chat_id, admin_id, target_name) VALUES (?, ?, ?, ?)",
-                (target_id, message.chat.id, message.from_user.id, target_name)
-            )
-            await db.commit()
-
-        await message.answer(
-            f"🔴 <b>{target_name}</b> получает бан навсегда\n"
-            f"👺 Модератор: <b>{moderator}</b>"
-        )
-    except TelegramAPIError as e:
-        logging.error(f"Ban error: {e}")
-        await message.reply("❌ Не удалось заблокировать пользователя.")
-
-# ================= РАЗБАН =================
-@group_router.message(F.text.regexp(UNBAN_PATTERN))
-async def cmd_unban_text(message: Message, bot: Bot):
-    args = UNBAN_PATTERN.sub("", message.text, count=1).strip()
-    target_id, target_name = await resolve_target(message, args)
-
-    if not target_id:
-        return await message.reply("🔍 Пользователь не найден.")
-    if not await check_admin_rights(message, bot, check_target=False):
-        return
-
-    target_name = escape(target_name)
-    moderator = escape(message.from_user.full_name)
-
-    try:
-        await bot.unban_chat_member(
-            chat_id=message.chat.id, user_id=target_id, only_if_banned=True
-        )
-        async with aiosqlite.connect("bot.db") as db:
-            await db.execute(
-                "DELETE FROM bans WHERE user_id = ? AND chat_id = ?",
-                (target_id, message.chat.id)
-            )
-            await db.commit()
-
-        await message.answer(
-            f"🟢 <b>{target_name}</b> разблокирован\n"
-            f"🛡 Модератор: <b>{moderator}</b>"
-        )
-    except TelegramAPIError as e:
-        logging.error(f"Unban error: {e}")
-        await message.reply("❌ Не удалось разблокировать.")
-
 # ================= КИК =================
+KICK_PATTERN = re.compile(r"^кик\b", re.IGNORECASE)
+
 @group_router.message(F.text.regexp(KICK_PATTERN))
 async def cmd_kick(message: Message, bot: Bot):
-    args = KICK_PATTERN.sub("", message.text, count=1).strip()
-    target_id, target_name = await resolve_target(message, args)
-
-    if not target_id:
-        return await message.reply("🔍 Кого кикаем? Нужен реплай или @username.")
-    if target_id == bot.id:
-        return await message.reply("Я не могу кикнуть сам себя.")
-    if not await check_admin_rights(message, bot, target_id):
+    if not await check_actor(message):
         return
-
-    target_name = escape(target_name)
-    moderator = escape(message.from_user.full_name)
-
+    rest = KICK_PATTERN.sub("", message.text, count=1).strip()
+    uid, name = await resolve_target(message, rest)
+    if not uid:
+        return await message.reply("🔍 Кого кикнуть?")
+    ok, err = await check_target(message, uid)
+    if not ok:
+        return await message.reply(err)
     try:
-        await bot.ban_chat_member(chat_id=message.chat.id, user_id=target_id)
-        await bot.unban_chat_member(
-            chat_id=message.chat.id, user_id=target_id, only_if_banned=True
-        )
+        await bot.ban_chat_member(message.chat.id, uid)
+        await bot.unban_chat_member(message.chat.id, uid, only_if_banned=True)
         await message.answer(
-            f"👞 <b>{target_name}</b> изгнан из чата (может сразу вернуться)\n"
-            f"👺 Модератор: <b>{moderator}</b>"
+            f"👞 <b>{name}</b> кикнут\n"
+            f"👤 Модератор: {escape(message.from_user.full_name)}"
         )
-    except TelegramAPIError as e:
-        logging.error(f"Kick error: {e}")
-        await message.reply("❌ Не удалось кикнуть пользователя.")
+    except TelegramAPIError:
+        await message.reply("❌ Не удалось.")
 
 # ================= МУТ =================
+MUTE_PATTERN = re.compile(r"^мут\b", re.IGNORECASE)
+UNMUTE_PATTERN = re.compile(r"^(?:размут|говори)\b", re.IGNORECASE)
+
 @group_router.message(F.text.regexp(MUTE_PATTERN))
 async def cmd_mute(message: Message, bot: Bot):
-    args = MUTE_PATTERN.sub("", message.text, count=1).strip()
-    target_id, target_name = await resolve_target(message, args)
-
-    if not target_id:
-        return await message.reply("🔍 Кому даём мут? Нужен реплай или @username.")
-    if target_id == bot.id:
+    if not await check_actor(message):
         return
-    if not await check_admin_rights(message, bot, target_id, need_restrict=True):
-        return
+    rest = MUTE_PATTERN.sub("", message.text, count=1).strip()
+    lines = rest.split("\n", 1)
+    first = lines[0].strip()
+    reason = lines[1].strip() if len(lines) > 1 else "Без причины"
 
-    target_name = escape(target_name)
-    moderator = escape(message.from_user.full_name)
+    period = None
+    parts = first.split(maxsplit=1)
+    if parts and parse_period(parts[0]):
+        period = parse_period(parts[0])
+        target_arg = parts[1] if len(parts) > 1 else ""
+    else:
+        target_arg = first
 
-    until = datetime.now(timezone.utc) + timedelta(days=7)
+    uid, name = await resolve_target(message, target_arg)
+    if not uid:
+        return await message.reply("🔍 Кого мутить?")
+    ok, err = await check_target(message, uid)
+    if not ok:
+        return await message.reply(err)
 
+    if not period:
+        period = 604800  # 7 дней по умолчанию
+    until = int(time.time()) + period
     try:
         await bot.restrict_chat_member(
-            chat_id=message.chat.id,
-            user_id=target_id,
-            permissions=full_mute_permissions(),
-            until_date=until,
+            message.chat.id, uid,
+            permissions=full_mute_perms(),
+            until_date=until
         )
         await message.answer(
-            f"🔇 <b>{target_name}</b> лишается права слова на 7 дней\n"
-            f"👺 Модератор: <b>{moderator}</b>"
+            f"🔇 <b>{name}</b> в муте\n"
+            f"📝 Причина: <i>{escape(reason)}</i>\n"
+            f"⏳ Срок: <b>{fmt_period(period)}</b>\n"
+            f"👤 Модератор: {escape(message.from_user.full_name)}"
         )
     except TelegramAPIError as e:
-        logging.error(f"Mute error: {e}")
-        await message.reply("❌ Не удалось замутить. Проверьте мои права.")
+        logging.error(f"mute: {e}")
+        await message.reply("❌ Не удалось. Проверь мои права.")
 
-# ================= РАЗМУТ =================
 @group_router.message(F.text.regexp(UNMUTE_PATTERN))
 async def cmd_unmute(message: Message, bot: Bot):
-    args = UNMUTE_PATTERN.sub("", message.text, count=1).strip()
-    target_id, target_name = await resolve_target(message, args)
-
-    if not target_id:
-        return await message.reply("🔍 Кому возвращаем голос? Нужен реплай или @username.")
-    if not await check_admin_rights(message, bot, check_target=False, need_restrict=True):
+    if not await check_actor(message):
         return
-
-    target_name = escape(target_name)
-
+    rest = UNMUTE_PATTERN.sub("", message.text, count=1).strip()
+    uid, name = await resolve_target(message, rest)
+    if not uid:
+        return await message.reply("🔍 Кого?")
     try:
         await bot.restrict_chat_member(
-            chat_id=message.chat.id,
-            user_id=target_id,
-            permissions=full_unmute_permissions(),
+            message.chat.id, uid,
+            permissions=full_unmute_perms(),
         )
-        await message.answer(
-            f"✅ Пользователю <b>{target_name}</b> вернули право слова. "
-            f"Следите за языком 😉"
-        )
-    except TelegramAPIError as e:
-        logging.error(f"Unmute error: {e}")
-        await message.reply("❌ Не удалось размутить.")
+        await message.answer(f"🔊 <b>{name}</b> размучен.")
+    except TelegramAPIError:
+        await message.reply("❌ Не удалось.")
 
 # ================= ВАРН =================
+WARN_PATTERN = re.compile(r"^варн\b", re.IGNORECASE)
+WARNS_PATTERN = re.compile(r"^варны\b", re.IGNORECASE)
+UNWARN_PATTERN = re.compile(r"^(?:-варн|снять варн)\b", re.IGNORECASE)
+
 @group_router.message(F.text.regexp(WARN_PATTERN))
 async def cmd_warn(message: Message, bot: Bot):
-    args = WARN_PATTERN.sub("", message.text, count=1).strip()
-    target_id, target_name = await resolve_target(message, args)
-
-    if not target_id:
-        return await message.reply("🔍 Кому выдаём варн? Нужен реплай или @username.")
-    if target_id == bot.id:
+    if not await check_actor(message):
         return
-    if not await check_admin_rights(message, bot, target_id):
-        return
+    rest = WARN_PATTERN.sub("", message.text, count=1).strip()
+    lines = rest.split("\n", 1)
+    first = lines[0].strip()
+    reason = lines[1].strip() if len(lines) > 1 else "Без причины"
 
-    target_name = escape(target_name)
-    moderator = escape(message.from_user.full_name)
+    uid, name = await resolve_target(message, first)
+    if not uid:
+        return await message.reply("🔍 Кому варн?")
+    ok, err = await check_target(message, uid)
+    if not ok:
+        return await message.reply(err)
 
-    async with aiosqlite.connect("bot.db") as db:
-        async with db.execute(
-            "SELECT count FROM warns WHERE user_id = ? AND chat_id = ?",
-            (target_id, message.chat.id)
-        ) as cursor:
-            row = await cursor.fetchone()
-            current_warns = row[0] if row else 0
+    count = await add_warn(uid, message.chat.id, reason, message.from_user.id)
 
-        current_warns += 1
-
-        if current_warns >= 3:
-            try:
-                await bot.ban_chat_member(chat_id=message.chat.id, user_id=target_id)
-                await db.execute(
-                    "DELETE FROM warns WHERE user_id = ? AND chat_id = ?",
-                    (target_id, message.chat.id)
-                )
-                await db.commit()
-                await message.answer(
-                    f"🔴 <b>{target_name}</b> превысил лимит предупреждений (3/3) "
-                    f"и получает бан навсегда\n"
-                    f"👺 Модератор: <b>{moderator}</b>"
-                )
-            except TelegramAPIError as e:
-                logging.error(f"Warn→Ban error: {e}")
-                await message.reply("❌ Ошибка при выдаче бана за варны.")
-        else:
-            await db.execute(
-                "INSERT OR REPLACE INTO warns (user_id, chat_id, count) VALUES (?, ?, ?)",
-                (target_id, message.chat.id, current_warns)
-            )
-            await db.commit()
+    if count >= 3:
+        try:
+            await bot.ban_chat_member(message.chat.id, uid)
+            await clear_warns(uid, message.chat.id)
             await message.answer(
-                f"❗️ <b>{target_name}</b> получает предупреждение ({current_warns}/3)\n"
-                f"👮‍♂️ Модератор: <b>{moderator}</b>"
+                f"🔴 <b>{name}</b> получил 3/3 варна и забанен.\n"
+                f"📝 Причина: <i>{escape(reason)}</i>"
             )
+        except TelegramAPIError:
+            await message.reply("❌ Не удалось забанить за варны.")
+    else:
+        await message.answer(
+            f"⚠️ <b>{name}</b> — предупреждение <b>{count}/3</b>\n"
+            f"📝 Причина: <i>{escape(reason)}</i>\n"
+            f"👤 Модератор: {escape(message.from_user.full_name)}"
+        )
 
-# ================= СНЯТИЕ ВАРНА =================
+@group_router.message(F.text.regexp(WARNS_PATTERN))
+async def cmd_warns(message: Message, bot: Bot):
+    if not await check_actor(message):
+        return
+    rest = WARNS_PATTERN.sub("", message.text, count=1).strip()
+    uid, name = await resolve_target(message, rest)
+    if not uid:
+        return await message.reply("🔍 Кому?")
+    async with aiosqlite.connect("bot.db") as db:
+        cur = await db.execute(
+            "SELECT reason FROM warns WHERE user_id=? AND chat_id=?",
+            (uid, message.chat.id))
+        rows = await cur.fetchall()
+    if not rows:
+        return await message.answer(f"✅ У <b>{name}</b> нет варнов.")
+    text = f"⚠️ <b>Варны {name}:</b>\n\n"
+    for i, (reason,) in enumerate(rows, 1):
+        text += f"{i}. <i>{escape(reason)}</i>\n"
+    await message.answer(text)
+
 @group_router.message(F.text.regexp(UNWARN_PATTERN))
 async def cmd_unwarn(message: Message, bot: Bot):
-    args = UNWARN_PATTERN.sub("", message.text, count=1).strip()
-    target_id, target_name = await resolve_target(message, args)
-
-    if not target_id:
-        return await message.reply("🔍 Кому снимаем варн? Нужен реплай или @username.")
-    if not await check_admin_rights(message, bot, check_target=False):
+    if not await check_actor(message):
         return
+    rest = UNWARN_PATTERN.sub("", message.text, count=1).strip()
+    uid, name = await resolve_target(message, rest)
+    if not uid:
+        return await message.reply("🔍 Кому?")
+    await clear_warns(uid, message.chat.id, count=1)
+    await message.answer(f"✅ С <b>{name}</b> снят один варн.")
 
-    target_name = escape(target_name)
-
-    async with aiosqlite.connect("bot.db") as db:
-        await db.execute(
-            "DELETE FROM warns WHERE user_id = ? AND chat_id = ?",
-            (target_id, message.chat.id)
-        )
-        await db.commit()
-
-    await message.answer(
-        f"✅ С пользователя <b>{target_name}</b> сняты все предупреждения."
-    )
-
-# ================= ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК =================
-@group_router.errors()
-@pm_router.errors()
-async def global_error_handler(event, **kwargs):
-    logging.error(f"Критическая ошибка: {event.exception}")
-    return True
-
-# ================= ЖИЗНЕННЫЙ ЦИКЛ =================
+# ================= ЗАПУСК =================
 async def on_startup(bot: Bot):
     await init_db()
-    logging.info(f"Установка вебхука: {WEBHOOK_URL}")
+    # Назначаем главным админам максимальный ранг
+    for uname in MAIN_ADMINS:
+        uid = await find_uid_by_username(uname)
+        if uid:
+            await set_rank(uid, RANK_MAX)
     await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+    logging.info(f"Вебхук установлен: {WEBHOOK_URL}")
 
 async def on_shutdown(bot: Bot):
-    logging.info("Удаление вебхука и остановка...")
     await bot.delete_webhook(drop_pending_updates=True)
 
 async def main():
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s'
-    )
-
+        format="%(asctime)s - %(levelname)s - %(message)s")
     bot = Bot(
         token=BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
-    )
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher()
-
-    dp.update.middleware(UserCacheMiddleware())
+    dp.update.middleware(UserCache())
     dp.include_routers(pm_router, group_router)
-
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
     app = web.Application()
-    handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
-    handler.register(app, path=WEBHOOK_PATH)
+    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
-
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
-    await site.start()
-
-    logging.info(f"Сервер запущен на порту {PORT}")
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
+    logging.info(f"Сервер на порту {PORT}")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logging.info("Бот остановлен.")
+        logging.info("Остановлен.")
