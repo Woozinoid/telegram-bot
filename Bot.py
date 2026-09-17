@@ -27,9 +27,9 @@ WEBHOOK_PATH = "/webhook"
 CHANNEL_ID = -1002396609986
 SUGGEST_GROUP_ID = -5369865912
 
-ADMIN_USERNAMES = ["Woozinoid", "roman3801"]  # кто может управлять
+ADMIN_USERNAMES = ["Woozinoid", "durovgar"]  # кто может управлять
 
-PUBLISH_INTERVAL = 150 * 60  # 2.5 часа
+PUBLISH_INTERVAL = 1 * 60  # 2.5 часа
 
 # ================= ХРАНИЛИЩА (в памяти) =================
 post_queue = asyncio.Queue()
