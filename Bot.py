@@ -107,7 +107,6 @@ async def get_display_name(uid):
     return str(uid)
 
 def user_mention(uid, name):
-    """Кликабельная HTML-ссылка на пользователя."""
     return f'<a href="tg://user?id={uid}">{escape(name)}</a>'
 
 async def get_rank(uid):
@@ -238,7 +237,6 @@ async def get_actor_rank(message):
     return await get_rank(message.from_user.id)
 
 async def check_target(message, target_uid):
-    """Проверка, можно ли действовать против цели."""
     if target_uid == message.from_user.id:
         return False, "🤔 На себя нельзя."
     if target_uid == message.bot.id:
@@ -256,7 +254,6 @@ async def check_target(message, target_uid):
     return True, ""
 
 async def target_suffix(target_uid, chat_id):
-    """Подпись внизу: если цель — админ/с рангом, напоминаем про превосходство."""
     is_privileged = False
     try:
         member = await bot.get_chat_member(chat_id, target_uid)
@@ -310,6 +307,7 @@ def full_unmute_perms():
 # ================= РОУТЕРЫ =================
 pm_router = Router()
 pm_router.message.filter(F.chat.type == "private")
+
 group_router = Router()
 group_router.message.filter(F.chat.type.in_({"group", "supergroup"}))
 
@@ -690,7 +688,7 @@ async def cmd_unwarn(message: Message, bot: Bot):
     await message.answer(f"✅ С {user_mention(uid, name)} снят один варн.")
 
 # ================= АВТО-РАЗБАН WHITELIST =================
-@dp.chat_member()
+@group_router.chat_member()
 async def auto_unban_whitelist(event: ChatMemberUpdated, bot: Bot):
     """Если пользователя из белого списка забанил кто-то другой (Iris) — разбан."""
     if event.chat.type not in ("group", "supergroup"):
