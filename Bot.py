@@ -1,371 +1,252 @@
-import asyncio
-import logging
 import os
-import re
-from datetime import datetime, timezone, timedelta
-
-from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command, CommandObject
-from aiogram.fsm.storage.memory import MemoryStorage
-import aiohttp
+import sys
+import logging
+import asyncio
+import aiosqlite
+from typing import Callable, Dict, Any, Awaitable
 from aiohttp import web
 
-# ================= НАСТРОЙКИ =================
-TOKEN = "8641527466:AAGSkaTzMJm5X6ExY3vVYRiMLxkwSxOOpnU"
-CHANNEL_ID = -1002313542500        # Канал для публикации
-ADMIN_GROUP_ID = -1002688386266    # Группа для просмотра предложки
+from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart, CommandObject
+from aiogram.types import Message, TelegramObject, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiogram.exceptions import TelegramAPIError
 
-ADMIN_USERNAMES = ["Woozinoid", "roman3801", "durovgar"]  # без @
+# --- Конфигурация ---
+# Токен и вебхук вставлены напрямую по твоему запросу. 
+# Примечание: порт (PORT) мы оставляем через os.getenv, так как Render назначает его динамически.
+BOT_TOKEN = "8823945629:AAHfN3LN7lFahjV7kSC5I8f8SXfM4mvCbKQ"
+WEBHOOK_URL = "https://telegram-bot-qxtd.onrender.com/webhook"
+PORT = int(os.getenv("PORT", 8080))
+WEBHOOK_PATH = "/webhook"
 
-MOSCOW_TZ = timezone(timedelta(hours=3))
-EKAT_TZ = timezone(timedelta(hours=5))   # Екатеринбург
-
-PUBLISH_INTERVAL = 10 # 2.5 часа
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-
-bot = Bot(token=TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
-
-# ================= ПАМЯТЬ =================
-banned_users = {}       # {user_id: {"reason": str, "date": str, "banned_by": str}}
-# Кэш username -> user_id (заполняется при бане по юзернейму)
-username_cache = {}     # {username_lower: user_id}
-
-daily_stats = {"sent": 0, "rejected": 0, "date": None}
-post_queue = asyncio.Queue()
-
-# ================= РАСШИРЕННЫЙ МАТ-ФИЛЬТР =================
-BAD_WORDS = [
-    r"\b(ху(й|и|е|я|ё|л[оёе]|йн[её]й|йло|ли)\b)",
-    r"\b(пизд(а|ы|е|у|ой|юк|юл[её]й|обол|острад)\b)",
-    r"\b(еба(ть|л|н|ло|нут|льник|нёт)\b)",
-    r"\b(бля(дь|ть|д|дина|дство|дский|дки)\b)",
-    r"\b(сук(а|и|ой|ин|чка|чька|чьку)\b)",
-    r"\b(залуп(а|ы|е|ой|ушка)\b)",
-    r"\b(жоп(а|ы|е|ой|ушка|олиз)\b)",
-    r"\b(гандон|мудак|пидор|пидр|пидрила|лох|лошара|у(е|ё)бок|у(е|ё)бище|мразь|тварь|сволочь|гнида|падла|шлюха|проститутка|гомик|лезбиянка|трахать|трах|отсос|минет|ахуеть|ахуенно|охуеть|нихуя|нихера|похер|пофиг)\b"
-]
-BAD_WORDS_PATTERN = re.compile("|".join(BAD_WORDS), re.IGNORECASE)
-
-def is_admin(user: types.User) -> bool:
-    if user.username is None:
-        return False
-    return user.username.lower() in [u.lower() for u in ADMIN_USERNAMES]
-
-def reset_daily_stats():
-    ekat_now = datetime.now(EKAT_TZ).date()
-    if daily_stats.get("date") != ekat_now:
-        daily_stats["sent"] = 0
-        daily_stats["rejected"] = 0
-        daily_stats["date"] = ekat_now
-
-# ================= ГЛАВНОЕ МЕНЮ =================
-def main_keyboard():
-    return types.ReplyKeyboardMarkup(
-        keyboard=[
-            [types.KeyboardButton(text="📊 Мой пост")],
-            [types.KeyboardButton(text="📨 Предложить новость")]
-        ],
-        resize_keyboard=True
-    )
-
-# ================= ПРОВЕРКА ГРАММАТИКИ (Яндекс.Спеллер) =================
-async def check_grammar(text: str) -> str:
-    url = "https://speller.yandex.net/services/spellservice.json/checkText"
-    params = {"text": text, "lang": "ru", "options": 0}
-    try:
-        timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url, params=params) as resp:
-                result = await resp.json()
-        if not result:
-            return text
-        for error in sorted(result, key=lambda x: x["pos"] + x["len"], reverse=True):
-            if error["s"]:
-                replacement = error["s"][0]
-                start = error["pos"]
-                end = error["pos"] + error["len"]
-                text = text[:start] + replacement + text[end:]
-        return text
-    except Exception as e:
-        logging.error(f"Yandex.Speller error: {e}")
-        return text
-
-# ================= УВЕДОМЛЕНИЕ АДМИНАМ =================
-async def notify_admins(text: str, user: types.User = None, status: str = "📨 ПРЕДЛОЖКА"):
-    if user:
-        author = f"@{user.username}" if user.username else user.first_name
-        user_link = f"@{user.username}" if user.username else f"tg://user?id={user.id}"
-        header = f"{status}\n👤 <b>От:</b> <a href='{user_link}'>{author}</a>\n🆔 ID: <code>{user.id}</code>\n\n"
-    else:
-        header = f"{status}\n\n"
-    full_text = f"{header}📝 <b>Текст:</b>\n{text}"
-    try:
-        await bot.send_message(chat_id=ADMIN_GROUP_ID, text=full_text, parse_mode="HTML")
-    except Exception as e:
-        logging.error(f"Notify admins error: {e}")
-
-# ================= ПРОВЕРКА МАТА =================
-def contains_bad_words(text: str) -> bool:
-    return bool(BAD_WORDS_PATTERN.search(text))
-
-# ================= ФОНОВАЯ ПУБЛИКАЦИЯ =================
-async def publisher():
-    while True:
-        await asyncio.sleep(PUBLISH_INTERVAL)
-        if post_queue.empty():
-            continue
-        post_data = await post_queue.get()
-        try:
-            await bot.send_message(
-                chat_id=CHANNEL_ID,
-                text=post_data["text"],
-                parse_mode="HTML",
-                disable_web_page_preview=True
+# --- Инициализация БД ---
+async def init_db():
+    async with aiosqlite.connect("bot.db") as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS bans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                chat_id INTEGER,
+                admin_id INTEGER,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
-            reset_daily_stats()
-            daily_stats["sent"] += 1
-            logging.info(f"Published post from {post_data.get('user_id', 'unknown')}")
-        except Exception as e:
-            logging.error(f"Publish error: {e}")
-            await notify_admins(f"❌ Ошибка публикации: {e}\nПост: {post_data['text']}")
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                full_name TEXT
+            )
+        """)
+        await db.commit()
 
-# ================= АДМИНСКИЕ КОМАНДЫ =================
-@dp.message(Command("ban"))
-async def cmd_ban(message: types.Message, command: CommandObject):
-    if not is_admin(message.from_user):
-        return await message.reply("⛔ Нет доступа")
-    args = command.args
+# --- Middleware для кэширования пользователей ---
+class UserCacheMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any]
+    ) -> Any:
+        user = data.get("event_from_user")
+        if user:
+            async with aiosqlite.connect("bot.db") as db:
+                await db.execute(
+                    "INSERT OR REPLACE INTO users (user_id, username, full_name) VALUES (?, ?, ?)",
+                    (user.id, user.username, user.full_name)
+                )
+                await db.commit()
+        return await handler(event, data)
+
+# --- Вспомогательные функции ---
+async def get_user_from_args(args: str) -> tuple[int, str] | None:
     if not args:
-        return await message.reply("Использование: /ban @username причина или /ban user_id причина")
-    parts = args.split(maxsplit=1)
-    target = parts[0]
-    reason = parts[1] if len(parts) > 1 else "Без причины"
+        return None
+        
+    arg = args.strip()
+    if arg.isdigit():
+        return int(arg), f"ID: {arg}"
+        
+    if arg.startswith("@"):
+        username = arg[1:]
+        async with aiosqlite.connect("bot.db") as db:
+            async with db.execute("SELECT user_id, full_name FROM users WHERE username = ? COLLATE NOCASE", (username,)) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    return row[0], row[1]
+    return None
 
-    # Определяем, user_id или @username
-    user_id = None
-    if target.startswith("@"):
-        username = target[1:].lower()  # убираем @ и приводим к нижнему регистру
-        # Ищем в кэше или пытаемся получить через API
-        if username in username_cache:
-            user_id = username_cache[username]
+async def check_admin_rights(message: Message, bot: Bot, target_id: int) -> bool:
+    try:
+        bot_member = await message.chat.get_member(bot.id)
+        if bot_member.status not in ("administrator", "creator"):
+            await message.reply("❌ У меня нет прав администратора в этом чате.")
+            return False
+            
+        user_member = await message.chat.get_member(message.from_user.id)
+        if user_member.status not in ("administrator", "creator"):
+            await message.reply("⛔ Эта команда доступна только администраторам.")
+            return False
+            
+        target_member = await message.chat.get_member(target_id)
+        if target_member.status in ("administrator", "creator"):
+            await message.reply("⚠️ Невозможно применить меру к другому администратору.")
+            return False
+            
+        return True
+    except TelegramAPIError as e:
+        logging.warning(f"Ошибка проверки прав: {e}")
+        return True 
+
+# --- Роутеры ---
+pm_router = Router()
+pm_router.message.filter(F.chat.type == "private")
+
+group_router = Router()
+group_router.message.filter(F.chat.type.in_({"group", "supergroup"}))
+
+# --- Команды Личных Сообщений ---
+@pm_router.message(CommandStart())
+async def cmd_start_pm(message: Message, bot: Bot):
+    me = await bot.get_me()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="➕ Добавить в свою группу", 
+            url=f"https://t.me/{me.username}?startgroup=true"
+        )
+    ]])
+    
+    text = (
+        f"Привет, <b>{message.from_user.first_name}</b>! 👋\n\n"
+        "Я — бот-менеджер для защиты ваших чатов.\n"
+        "Добавь меня в свою группу и назначь администратором, чтобы я мог "
+        "удалять нарушителей по команде <code>/ban</code> и <code>/unban</code>."
+    )
+    await message.answer(text, reply_markup=kb)
+
+# --- Команды Группы ---
+@group_router.message(Command("ban"))
+async def cmd_ban(message: Message, bot: Bot, command: CommandObject):
+    target_id = None
+    target_name = "Пользователь"
+
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+        target_name = message.reply_to_message.from_user.full_name
+    elif command.args:
+        user_data = await get_user_from_args(command.args)
+        if user_data:
+            target_id, target_name = user_data
         else:
-            # Пытаемся найти пользователя (но для этого бот должен с ним взаимодействовать)
-            await message.reply("Для бана по юзернейму пользователь должен сначала написать боту. Если он писал, попробуйте /banid <user_id> причина")
-            return
-    elif target.isdigit():
-        user_id = int(target)
+            return await message.reply("🔍 Пользователь не найден в моей базе. Используйте ответ на сообщение (Reply) или точный ID.")
     else:
-        return await message.reply("Укажите @username или числовой ID")
+        return await message.reply("Используйте команду в ответ на сообщение, либо укажите <code>/ban @username</code> или <code>/ban ID</code>.")
 
-    banned_users[user_id] = {
-        "reason": reason,
-        "date": datetime.now(MOSCOW_TZ).strftime("%d.%m.%Y %H:%M"),
-        "banned_by": message.from_user.username or message.from_user.first_name
-    }
-    # Обновляем кэш, если был username
-    if target.startswith("@"):
-        username_cache[target[1:].lower()] = user_id
+    if target_id == bot.id:
+        return await message.reply("Я не могу заблокировать сам себя.")
+
+    if not await check_admin_rights(message, bot, target_id):
+        return
 
     try:
-        await bot.send_message(
-            chat_id=user_id,
-            text=(
-                f"⛔ <b>Вы заблокированы</b>\n"
-                f"📅 Дата: {banned_users[user_id]['date']} (МСК)\n"
-                f"📝 Причина: {reason}\n"
-                f"🔓 Для разбана обратитесь к @Woozinoid"
-            ),
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        logging.warning(f"Could not notify banned user {user_id}: {e}")
-    await message.reply(f"✅ Пользователь {user_id} забанен. Причина: {reason}")
+        await bot.ban_chat_member(chat_id=message.chat.id, user_id=target_id)
+        
+        async with aiosqlite.connect("bot.db") as db:
+            await db.execute(
+                "INSERT INTO bans (user_id, chat_id, admin_id) VALUES (?, ?, ?)",
+                (target_id, message.chat.id, message.from_user.id)
+            )
+            await db.commit()
+            
+        await message.answer(f"🔨 Пользователь <b>{target_name}</b> заблокирован.")
+    except TelegramAPIError as e:
+        logging.error(f"Ошибка API при бане: {e}")
+        await message.reply("❌ Не удалось заблокировать пользователя.")
 
-@dp.message(Command("unban"))
-async def cmd_unban(message: types.Message, command: CommandObject):
-    if not is_admin(message.from_user):
-        return await message.reply("⛔ Нет доступа")
-    args = command.args
-    if not args or not args.isdigit():
-        return await message.reply("Использование: /unban <user_id>")
-    user_id = int(args)
-    if user_id in banned_users:
-        del banned_users[user_id]
-        await message.reply(f"✅ Пользователь {user_id} разбанен")
+@group_router.message(Command("unban"))
+async def cmd_unban(message: Message, bot: Bot, command: CommandObject):
+    target_id = None
+    target_name = "Пользователь"
+
+    if message.reply_to_message:
+        target_id = message.reply_to_message.from_user.id
+        target_name = message.reply_to_message.from_user.full_name
+    elif command.args:
+        user_data = await get_user_from_args(command.args)
+        if user_data:
+            target_id, target_name = user_data
+        else:
+            return await message.reply("🔍 Пользователь не найден. Убедитесь, что он писал в этот чат ранее, или укажите его числовой ID.")
     else:
-        await message.reply("❌ Пользователь не в бане")
+        return await message.reply("Используйте команду в ответ на сообщение, либо укажите <code>/unban @username</code> или <code>/unban ID</code>.")
 
-@dp.message(Command("banlist"))
-async def cmd_banlist(message: types.Message):
-    if not is_admin(message.from_user):
-        return await message.reply("⛔ Нет доступа")
-    if not banned_users:
-        return await message.reply("📋 Список забаненных пуст")
-    text = "📋 <b>Забаненные пользователи:</b>\n\n"
-    for uid, data in banned_users.items():
-        text += (
-            f"🆔 <code>{uid}</code>\n"
-            f"📅 {data['date']}\n"
-            f"📝 {data['reason']}\n"
-            f"👤 Кто забанил: {data['banned_by']}\n\n"
-        )
-    await message.reply(text, parse_mode="HTML")
+    try:
+        user_member = await message.chat.get_member(message.from_user.id)
+        if user_member.status not in ("administrator", "creator"):
+            return await message.reply("⛔ Эта команда доступна только администраторам.")
+    except TelegramAPIError:
+        pass
 
-@dp.message(Command("stats"))
-async def cmd_stats(message: types.Message):
-    if not is_admin(message.from_user):
-        return await message.reply("⛔ Нет доступа")
-    reset_daily_stats()
-    sent = daily_stats["sent"]
-    rejected = daily_stats["rejected"]
-    in_queue = post_queue.qsize()
-    await message.reply(
-        f"📊 <b>Статистика за сегодня</b>\n"
-        f"✅ Опубликовано: {sent}\n"
-        f"❌ Отклонено: {rejected}\n"
-        f"⏳ В очереди: {in_queue}",
-        parse_mode="HTML"
-    )
+    try:
+        await bot.unban_chat_member(chat_id=message.chat.id, user_id=target_id, only_if_banned=True)
+        
+        async with aiosqlite.connect("bot.db") as db:
+            await db.execute("DELETE FROM bans WHERE user_id = ? AND chat_id = ?", (target_id, message.chat.id))
+            await db.commit()
+            
+        await message.answer(f"🕊 Пользователь <b>{target_name}</b> разблокирован и может снова присоединиться к чату.")
+    except TelegramAPIError as e:
+        logging.error(f"Ошибка API при разбане: {e}")
+        await message.reply("❌ Не удалось разблокировать. Возможно, он и не был в бане.")
 
-# ================= ОБРАБОТКА СООБЩЕНИЙ =================
-@dp.message(Command("start"))
-async def start_cmd(message: types.Message):
-    await message.answer(
-        "📨 <b>Добро пожаловать в предложку «Ищу тебя Екатеринбург»!</b>\n\n"
-        "Здесь вы можете отправить свою анкету или объявление, "
-        "которое после проверки грамматики будет опубликовано в канале.\n\n"
-        "👨‍💼 Создатели канала: @Woozinoid и @roman3801\n"
-        "🤖 Создатель бота: @Woozinoid\n\n"
-        "⚠️ Посты выходят каждые 2.5 часа.\n"
-        "🚫 Мат запрещён!",
-        parse_mode="HTML",
-        reply_markup=main_keyboard()
-    )
+# --- Глобальный обработчик ошибок ---
+@group_router.errors()
+@pm_router.errors()
+async def global_error_handler(event, **kwargs):
+    logging.error(f"Критическая ошибка: {event.exception}")
+    return True
 
-@dp.message(F.text == "📊 Мой пост")
-async def my_post_status(message: types.Message):
-    uid = message.from_user.id
-    found_position = None
-    for idx, item in enumerate(post_queue._queue):
-        if item.get("user_id") == uid:
-            found_position = idx + 1
-            break
-    if found_position is None:
-        await message.answer("❌ У вас нет постов в очереди.")
-        return
+# --- Жизненный цикл бота ---
+async def on_startup(bot: Bot):
+    await init_db()
+    logging.info(f"Установка вебхука на {WEBHOOK_URL}")
+    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
 
-    remaining_seconds = found_position * PUBLISH_INTERVAL
-    days = remaining_seconds // 86400
-    hours = (remaining_seconds % 86400) // 3600
-    minutes = (remaining_seconds % 3600) // 60
-    seconds = remaining_seconds % 60
-
-    publish_time = datetime.now(EKAT_TZ) + timedelta(seconds=remaining_seconds)
-    time_str = publish_time.strftime("%d.%m.%Y %H:%M")
-
-    parts = []
-    if days: parts.append(f"{days} дн")
-    if hours: parts.append(f"{hours} ч")
-    if minutes: parts.append(f"{minutes} мин")
-    if seconds or not parts: parts.append(f"{seconds} сек")
-    duration_str = " ".join(parts)
-
-    await message.answer(
-        f"📊 Ваш пост находится на позиции <b>{found_position}</b>\n"
-        f"⏳ До публикации осталось: {duration_str}\n"
-        f"🕒 Будет опубликован (Екб): {time_str}",
-        parse_mode="HTML"
-    )
-
-@dp.message(F.text == "📨 Предложить новость")
-async def suggest_prompt(message: types.Message):
-    await message.answer(
-        "✏️ Просто отправьте текст (или фото/видео с подписью) — "
-        "я проверю грамматику и поставлю в очередь на публикацию."
-    )
-
-@dp.message(F.text & ~F.text.startswith("/"))
-async def handle_text(message: types.Message):
-    if message.sender_chat or message.chat.type == "channel":
-        return
-    user = message.from_user
-    if not user:
-        return
-    uid = user.id
-
-    # Сохраняем username в кэш для бана по юзернейму
-    if user.username:
-        username_cache[user.username.lower()] = uid
-
-    if uid == 777000:
-        return
-
-    if uid in banned_users:
-        ban_data = banned_users[uid]
-        await message.answer(
-            f"⛔ <b>Вы заблокированы</b>\n"
-            f"📅 Дата: {ban_data['date']}\n"
-            f"📝 Причина: {ban_data['reason']}\n"
-            f"🔓 Обратитесь к @Woozinoid",
-            parse_mode="HTML"
-        )
-        return
-
-    original_text = message.text
-    if original_text in ["📊 Мой пост", "📨 Предложить новость"]:
-        return
-
-    await notify_admins(original_text, user, "📨 ПРЕДЛОЖКА")
-
-    if contains_bad_words(original_text):
-        reset_daily_stats()
-        daily_stats["rejected"] += 1
-        await message.answer(
-            "❌ <b>Сообщение отклонено</b> из-за нецензурной лексики.\n"
-            "Пожалуйста, исправьте текст и отправьте снова.",
-            parse_mode="HTML"
-        )
-        await notify_admins(original_text, user, "❌ ОТКЛОНЕНО (мат)")
-        return
-
-    status_msg = await message.answer("🔍 Проверяю грамматику...")
-    corrected_text = await check_grammar(original_text)
-    if corrected_text != original_text:
-        await notify_admins(corrected_text, user, "✅ ИСПРАВЛЕНО")
-
-    post_text = (
-        f"{corrected_text}\n\n"
-        f"<a href='https://t.me/WoozinoidLife'>ИЩУ ТЕБЯ ЕКАТЕРИНБУРГ ПОДПИСЫВАЙТЕСЬ</a>"
-    )
-
-    await post_queue.put({"text": post_text, "user_id": uid})
-    queue_len = post_queue.qsize()
-    approx_time = datetime.now(EKAT_TZ) + timedelta(seconds=PUBLISH_INTERVAL * queue_len)
-    time_str = approx_time.strftime("%H:%M")
-    await status_msg.edit_text(
-        f"✅ <b>Пост принят!</b>\n"
-        f"⏳ Будет опубликован примерно в {time_str} (Екб)\n"
-        f"📌 Позиция в очереди: {queue_len}",
-        parse_mode="HTML"
-    )
-
-# ================= ВЕБ-СЕРВЕР =================
-async def home(request):
-    return web.Response(text="Bot is running")
+async def on_shutdown(bot: Bot):
+    logging.info("Удаление вебхука и остановка...")
+    await bot.delete_webhook(drop_pending_updates=True)
 
 async def main():
-    asyncio.create_task(publisher())
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher()
+    
+    dp.update.middleware(UserCacheMiddleware())
+    dp.include_routers(pm_router, group_router)
+    
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
+    
     app = web.Application()
-    app.router.add_get("/", home)
+    webhook_requests_handler = SimpleRequestHandler(dispatcher=dp, bot=bot)
+    webhook_requests_handler.register(app, path=WEBHOOK_PATH)
+    setup_application(app, dp, bot=bot)
+    
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.getenv("PORT", 8080))
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
     await site.start()
-    logging.info(f"Web server started on port {port}")
-    await dp.start_polling(bot, drop_pending_updates=True)
+    
+    logging.info(f"Сервер запущен на порту {PORT}")
+    
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Бот остановлен.")
