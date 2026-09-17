@@ -21,22 +21,12 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 from aiogram.exceptions import TelegramAPIError
 
 # ================= КОНФИГУРАЦИЯ =================
-# Токен и URL берём из переменных окружения Render.
-# В коде — только заглушки на случай локального запуска.
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
+BOT_TOKEN = "8823945629:AAHfN3LN7lFahjV7kSC5I8f8SXfM4mvCbKQ"
+WEBHOOK_URL = "https://telegram-bot-qxtd.onrender.com/webhook"
 PORT = int(os.getenv("PORT", 8080))
 WEBHOOK_PATH = "/webhook"
 
-if not BOT_TOKEN:
-    logging.critical("ОШИБКА: переменная BOT_TOKEN не задана.")
-    sys.exit(1)
-if not WEBHOOK_URL:
-    logging.critical("ОШИБКА: переменная WEBHOOK_URL не задана.")
-    sys.exit(1)
-
 # ================= РЕГУЛЯРНЫЕ ВЫРАЖЕНИЯ =================
-# \b гарантирует, что команда не сработает на "банан", "мутант", "вареник" и т.д.
 BAN_PATTERN     = re.compile(r"^(?:/|!)?(?:бан|ban)\b", re.IGNORECASE)
 UNBAN_PATTERN   = re.compile(r"^(?:/|!)?(?:разбан|unban)\b", re.IGNORECASE)
 KICK_PATTERN    = re.compile(r"^(?:/|!)?(?:кик|kick)\b", re.IGNORECASE)
@@ -96,9 +86,7 @@ class UserCacheMiddleware(BaseMiddleware):
         return await handler(event, data)
 
 # ================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =================
-
 async def get_user_from_args(args: str) -> tuple[int, str] | None:
-    """Возвращает (user_id, full_name) по @username или числовому ID."""
     if not args:
         return None
     arg = args.strip()
@@ -124,15 +112,7 @@ async def check_admin_rights(
     check_target: bool = True,
     need_restrict: bool = False,
 ) -> bool:
-    """
-    Проверяет:
-      1. Бот — админ и имеет право restrict_members (если нужно)
-      2. Вызывающий — админ
-      3. Цель — не админ (если check_target=True)
-    Возвращает True, если всё ок.
-    """
     try:
-        # Бот — админ?
         bot_member = await message.chat.get_member(bot.id)
         if bot_member.status not in ("administrator", "creator"):
             await message.reply("❌ У меня нет прав администратора в этом чате.")
@@ -141,13 +121,11 @@ async def check_admin_rights(
             await message.reply("❌ У меня нет права ограничивать участников.")
             return False
 
-        # Вызывающий — админ?
         user_member = await message.chat.get_member(message.from_user.id)
         if user_member.status not in ("administrator", "creator"):
             await message.reply("⛔ Эта команда доступна только администраторам.")
             return False
 
-        # Цель — не админ?
         if check_target and target_id:
             try:
                 target_member = await message.chat.get_member(target_id)
@@ -155,18 +133,15 @@ async def check_admin_rights(
                     await message.reply("⚠️ Нельзя применить это к администратору.")
                     return False
             except TelegramAPIError:
-                # Цель не в чате — не блокируем действие.
                 pass
 
         return True
     except TelegramAPIError as e:
         logging.warning(f"Ошибка проверки прав: {e}")
-        # Если не удалось проверить — разрешаем (бан по ID юзера не в чате).
         return True
 
 
 async def resolve_target(message: Message, args: str) -> tuple[int, str] | tuple[None, None]:
-    """Возвращает (user_id, full_name) из реплая или из аргументов."""
     if message.reply_to_message and message.reply_to_message.from_user:
         return (
             message.reply_to_message.from_user.id,
@@ -180,7 +155,6 @@ async def resolve_target(message: Message, args: str) -> tuple[int, str] | tuple
 
 
 def full_mute_permissions() -> ChatPermissions:
-    """Полный запрет на всё."""
     return ChatPermissions(
         can_send_messages=False,
         can_send_audios=False,
@@ -196,7 +170,6 @@ def full_mute_permissions() -> ChatPermissions:
 
 
 def full_unmute_permissions() -> ChatPermissions:
-    """Полное разрешение на всё."""
     return ChatPermissions(
         can_send_messages=True,
         can_send_audios=True,
@@ -209,7 +182,6 @@ def full_unmute_permissions() -> ChatPermissions:
         can_send_other_messages=True,
         can_add_web_page_previews=True,
     )
-
 
 # ================= РОУТЕРЫ =================
 pm_router = Router()
@@ -395,7 +367,6 @@ async def cmd_mute(message: Message, bot: Bot):
     target_name = escape(target_name)
     moderator = escape(message.from_user.full_name)
 
-    # ВАЖНО: until_date принимает datetime, а не timedelta!
     until = datetime.now(timezone.utc) + timedelta(days=7)
 
     try:
@@ -537,7 +508,7 @@ async def on_shutdown(bot: Bot):
 async def main():
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asct **ime)s - %(levelname)s - %(message)s'
+        format='%(asctime)s - %(levelname)s - %(message)s'
     )
 
     bot = Bot(
