@@ -32,6 +32,8 @@ MAIN_ADMINS = ["Woozinoid"]
 RANK_MAX = 3
 RANK_STARS = {1: "⭐️", 2: "⭐️⭐️", 3: "⭐️⭐️⭐️"}
 
+CMD = "$"
+
 # ================= ПАРСЕР ПЕРИОДА =================
 UNITS = [
     ("месяц", 2592000), ("мес", 2592000),
@@ -82,6 +84,8 @@ async def init_db():
             user_id INTEGER, chat_id INTEGER,
             added_by INTEGER, added_at INTEGER,
             PRIMARY KEY (user_id, chat_id))""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS invite_links (
+            chat_id INTEGER PRIMARY KEY, link TEXT, updated_at INTEGER)""")
         await db.commit()
 
 async def save_user(uid, username, full_name):
@@ -156,6 +160,26 @@ async def wl_list(chat_id):
             "SELECT user_id, added_by, added_at FROM whitelist WHERE chat_id=? ORDER BY added_at",
             (chat_id,))
         return await cur.fetchall()
+
+async def wl_all_ids(chat_id):
+    async with aiosqlite.connect("bot.db") as db:
+        cur = await db.execute(
+            "SELECT user_id FROM whitelist WHERE chat_id=?", (chat_id,))
+        return [r[0] for r in await cur.fetchall()]
+
+# ---- INVITE CACHE ----
+async def get_cached_link(chat_id):
+    async with aiosqlite.connect("bot.db") as db:
+        cur = await db.execute("SELECT link FROM invite_links WHERE chat_id=?", (chat_id,))
+        r = await cur.fetchone()
+        return r[0] if r else None
+
+async def cache_link(chat_id, link):
+    async with aiosqlite.connect("bot.db") as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO invite_links (chat_id, link, updated_at) VALUES (?, ?, ?)",
+            (chat_id, link, int(time.time())))
+        await db.commit()
 
 # ---- WARNS ----
 async def add_warn(uid, chat_id, reason, by_id):
@@ -273,12 +297,15 @@ async def target_suffix(target_uid, chat_id):
 
 # ================= ВСПОМОГАТЕЛЬНОЕ =================
 async def resolve_target(message, args):
-    if message.reply_to_message and message.reply_to_message.from_user:
-        u = message.reply_to_message.from_user
-        await save_user(u.id, u.username or "", u.full_name)
-        return u.id, u.full_name
+    if message.reply_to_message:
+        rt = message.reply_to_message
+        if rt.from_user:
+            u = rt.from_user
+            await save_user(u.id, u.username or "", u.full_name)
+            return u.id, u.full_name
     if args:
         arg = args.strip().split()[0]
+        arg = arg.lstrip("$")
         if arg.isdigit():
             uid = int(arg)
             return uid, await get_display_name(uid)
@@ -304,6 +331,48 @@ def full_unmute_perms():
         can_send_voice_notes=True, can_send_polls=True,
         can_send_other_messages=True, can_add_web_page_previews=True)
 
+async def get_or_create_invite(chat_id):
+    """Возвращает ссылку-приглашение в чат (из кэша или создаёт новую)."""
+    cached = await get_cached_link(chat_id)
+    if cached:
+        return cached
+    try:
+        chat = await bot.get_chat(chat_id)
+        if chat.invite_link:
+            await cache_link(chat_id, chat.invite_link)
+            return chat.invite_link
+    except TelegramAPIError:
+        pass
+    try:
+        link_obj = await bot.create_chat_invite_link(
+            chat_id=chat_id,
+            name="Whitelist return",
+        )
+        await cache_link(chat_id, link_obj.invite_link)
+        return link_obj.invite_link
+    except TelegramAPIError as e:
+        logging.warning(f"Не удалось создать ссылку для {chat_id}: {e}")
+        return None
+
+async def send_wl_dm(user_id, chat_title, chat_id, reason: str = "бан"):
+    """Пишет пользователю в ЛС: его вернули, вот ссылка."""
+    link = await get_or_create_invite(chat_id)
+    text = (
+        f"🛡 <b>Вас попытались наказать в чате «{escape(chat_title)}»</b>\n\n"
+        f"Причина: <i>{escape(reason)}</i>\n"
+        f"Но вы в белом списке — наказание снято."
+    )
+    if link:
+        text += f"\n\n🔗 <b>Вернуться в чат:</b> {link}"
+    else:
+        text += f"\n\n🔗 Ссылку создать не удалось — попросите админов."
+    try:
+        await bot.send_message(user_id, text, disable_web_page_preview=True)
+        return True
+    except TelegramAPIError as e:
+        logging.warning(f"Не смог написать в ЛС {user_id}: {e}")
+        return False
+
 # ================= РОУТЕРЫ =================
 pm_router = Router()
 pm_router.message.filter(F.chat.type == "private")
@@ -316,22 +385,28 @@ group_router.message.filter(F.chat.type.in_({"group", "supergroup"}))
 async def start_pm(message: Message, bot: Bot):
     await message.answer(
         f"👋 <b>Привет, {escape(message.from_user.first_name)}!</b>\n\n"
-        f"Я — модератор-бот с рангами и белым списком.\n\n"
+        f"Я — модератор-бот с рангами и белым списком.\n"
+        f"<b>Все команды начинаются с <code>$</code></b> — чтобы не пересекаться с Iris.\n\n"
         f"<b>Команды:</b>\n"
-        f"🔨 <code>бан [срок] @user</code>\n"
-        f"🔇 <code>мут [срок] @user</code>\n"
-        f"👞 <code>кик @user</code>\n"
-        f"⚠️ <code>варн @user</code>\n"
-        f"➕ <code>++модер 1|2|3 @user</code>\n"
-        f"➖ <code>-модер @user</code>\n"
-        f"🛡 <code>добавить в белый список @user</code>\n"
-        f"📋 <code>белый список</code>\n"
-        f"👥 <code>админы</code>"
+        f"🔨 <code>$бан [срок] @user</code>\n"
+        f"🔇 <code>$мут [срок] @user</code>\n"
+        f"👞 <code>$кик @user</code>\n"
+        f"⚠️ <code>$варн @user</code>\n"
+        f"✅ <code>$разбан @user</code>\n"
+        f"📋 <code>$банлист</code>\n"
+        f"📋 <code>$варны @user</code>\n"
+        f"➕ <code>$ранг 1|2|3 @user</code>\n"
+        f"➖ <code>$разжаловать @user</code>\n"
+        f"🛡 <code>$бс добавить @user</code>\n"
+        f"🛡 <code>$бс убрать @user</code>\n"
+        f"🛡 <code>$белый список</code>\n"
+        f"👥 <code>$админы</code>\n"
+        f"🔄 <code>$проверить бс</code>"
     )
 
-# ================= ++МОДЕР =================
-SETRANK_PATTERN = re.compile(r"^\+\+модер\s+(\d+)\b", re.IGNORECASE)
-UNRANK_PATTERN = re.compile(r"^(?:-модер|--модер|снять модер)\b", re.IGNORECASE)
+# ================= РАНГИ =================
+SETRANK_PATTERN = re.compile(rf"^{re.escape(CMD)}ранг\s+(\d+)\b", re.IGNORECASE)
+UNRANK_PATTERN = re.compile(rf"^{re.escape(CMD)}разжаловать\b", re.IGNORECASE)
 
 @group_router.message(F.text.regexp(SETRANK_PATTERN))
 async def cmd_set_rank(message: Message, bot: Bot):
@@ -366,9 +441,10 @@ async def cmd_unrank(message: Message, bot: Bot):
     await message.answer(f"❌ {user_mention(uid, name)} лишён ранга.")
 
 # ================= БЕЛЫЙ СПИСОК =================
-WL_ADD_PATTERN = re.compile(r"^(?:добавить в белый список|доб в бс|в бс)\b", re.IGNORECASE)
-WL_REM_PATTERN = re.compile(r"^(?:убрать из белого списка|убрать из бс|из бс)\b", re.IGNORECASE)
-WL_LIST_PATTERN = re.compile(r"^белый список\b", re.IGNORECASE)
+WL_ADD_PATTERN = re.compile(rf"^{re.escape(CMD)}бс\s+(?:добавить|доб|add)\b", re.IGNORECASE)
+WL_REM_PATTERN = re.compile(rf"^{re.escape(CMD)}бс\s+(?:убрать|убр|del|remove)\b", re.IGNORECASE)
+WL_LIST_PATTERN = re.compile(rf"^{re.escape(CMD)}(?:белый список|бс)\s*$", re.IGNORECASE)
+WL_CHECK_PATTERN = re.compile(rf"^{re.escape(CMD)}проверить бс\b", re.IGNORECASE)
 
 @group_router.message(F.text.regexp(WL_ADD_PATTERN))
 async def cmd_wl_add(message: Message, bot: Bot):
@@ -383,7 +459,8 @@ async def cmd_wl_add(message: Message, bot: Bot):
     await wl_add(uid, message.chat.id, message.from_user.id)
     await message.answer(
         f"🛡 {user_mention(uid, name)} добавлен в белый список.\n"
-        f"<i>Его нельзя забанить, замутить, кикнуть или выдать варн.</i>"
+        f"<i>Любые наказания от Iris будут автоматически сняты, "
+        f"а пользователю придёт ссылка в ЛС.</i>"
     )
 
 @group_router.message(F.text.regexp(WL_REM_PATTERN))
@@ -414,8 +491,38 @@ async def cmd_wl_list(message: Message, bot: Bot):
         text += f"{i}. {user_mention(uid, name)} — добавил {escape(by_name)} ({date})\n"
     await message.answer(text)
 
+@group_router.message(F.text.regexp(WL_CHECK_PATTERN))
+async def cmd_wl_check(message: Message, bot: Bot):
+    if not await check_actor(message):
+        return
+    ids = await wl_all_ids(message.chat.id)
+    if not ids:
+        return await message.reply("📭 Белый список пуст.")
+    unbanned = 0
+    unmuted = 0
+    for uid in ids:
+        try:
+            member = await bot.get_chat_member(message.chat.id, uid)
+            if member.status == "kicked":
+                await bot.unban_chat_member(message.chat.id, uid, only_if_banned=True)
+                await send_wl_dm(uid, message.chat.title or "чат", message.chat.id, "бан от Iris")
+                unbanned += 1
+            elif member.status == "restricted" and not member.can_send_messages:
+                await bot.restrict_chat_member(
+                    message.chat.id, uid, permissions=full_unmute_perms())
+                unmuted += 1
+        except TelegramAPIError:
+            pass
+    parts = []
+    if unbanned: parts.append(f"разбанено: {unbanned}")
+    if unmuted: parts.append(f"размучено: {unmuted}")
+    if parts:
+        await message.answer("🔄 " + ", ".join(parts))
+    else:
+        await message.answer("✅ Все из белого списка в порядке.")
+
 # ================= АДМИНЫ =================
-ADMINS_PATTERN = re.compile(r"^админы\b", re.IGNORECASE)
+ADMINS_PATTERN = re.compile(rf"^{re.escape(CMD)}админы\b", re.IGNORECASE)
 
 @group_router.message(F.text.regexp(ADMINS_PATTERN))
 async def cmd_admins(message: Message, bot: Bot):
@@ -456,9 +563,9 @@ async def cmd_admins(message: Message, bot: Bot):
     await message.answer(text)
 
 # ================= БАН =================
-BAN_PATTERN = re.compile(r"^(?:/|!)?бан\b", re.IGNORECASE)
-UNBAN_PATTERN = re.compile(r"^(?:разбан|unban)\b", re.IGNORECASE)
-BANLIST_PATTERN = re.compile(r"^банлист\b", re.IGNORECASE)
+BAN_PATTERN = re.compile(rf"^{re.escape(CMD)}бан\b", re.IGNORECASE)
+UNBAN_PATTERN = re.compile(rf"^{re.escape(CMD)}(?:разбан|unban)\b", re.IGNORECASE)
+BANLIST_PATTERN = re.compile(rf"^{re.escape(CMD)}банлист\b", re.IGNORECASE)
 
 @group_router.message(F.text.regexp(BAN_PATTERN))
 async def cmd_ban(message: Message, bot: Bot):
@@ -479,7 +586,7 @@ async def cmd_ban(message: Message, bot: Bot):
 
     uid, name = await resolve_target(message, target_arg)
     if not uid:
-        return await message.reply("🔍 Кого банить? Укажи @username или ответь.")
+        return await message.reply("🔍 Кого банить? Укажи @username или ответь на сообщение.")
     ok, err = await check_target(message, uid)
     if not ok:
         return await message.reply(err)
@@ -529,7 +636,7 @@ async def cmd_banlist(message: Message):
     await message.answer(text)
 
 # ================= КИК =================
-KICK_PATTERN = re.compile(r"^кик\b", re.IGNORECASE)
+KICK_PATTERN = re.compile(rf"^{re.escape(CMD)}кик\b", re.IGNORECASE)
 
 @group_router.message(F.text.regexp(KICK_PATTERN))
 async def cmd_kick(message: Message, bot: Bot):
@@ -555,8 +662,8 @@ async def cmd_kick(message: Message, bot: Bot):
         await message.reply("❌ Не удалось.")
 
 # ================= МУТ =================
-MUTE_PATTERN = re.compile(r"^мут\b", re.IGNORECASE)
-UNMUTE_PATTERN = re.compile(r"^(?:размут|говори)\b", re.IGNORECASE)
+MUTE_PATTERN = re.compile(rf"^{re.escape(CMD)}мут\b", re.IGNORECASE)
+UNMUTE_PATTERN = re.compile(rf"^{re.escape(CMD)}(?:размут|unmute)\b", re.IGNORECASE)
 
 @group_router.message(F.text.regexp(MUTE_PATTERN))
 async def cmd_mute(message: Message, bot: Bot):
@@ -619,9 +726,9 @@ async def cmd_unmute(message: Message, bot: Bot):
         await message.reply("❌ Не удалось.")
 
 # ================= ВАРН =================
-WARN_PATTERN = re.compile(r"^варн\b", re.IGNORECASE)
-WARNS_PATTERN = re.compile(r"^варны\b", re.IGNORECASE)
-UNWARN_PATTERN = re.compile(r"^(?:-варн|снять варн)\b", re.IGNORECASE)
+WARN_PATTERN = re.compile(rf"^{re.escape(CMD)}варн\b", re.IGNORECASE)
+WARNS_PATTERN = re.compile(rf"^{re.escape(CMD)}варны\b", re.IGNORECASE)
+UNWARN_PATTERN = re.compile(rf"^{re.escape(CMD)}(?:-варн|снять варн)\b", re.IGNORECASE)
 
 @group_router.message(F.text.regexp(WARN_PATTERN))
 async def cmd_warn(message: Message, bot: Bot):
@@ -687,25 +794,88 @@ async def cmd_unwarn(message: Message, bot: Bot):
     await clear_warns(uid, message.chat.id, count=1)
     await message.answer(f"✅ С {user_mention(uid, name)} снят один варн.")
 
-# ================= АВТО-РАЗБАН WHITELIST =================
+# ================= ЗАЩИТА БЕЛОГО СПИСКА ОТ IRIS =================
 @group_router.chat_member()
-async def auto_unban_whitelist(event: ChatMemberUpdated, bot: Bot):
-    """Если пользователя из белого списка забанил кто-то другой (Iris) — разбан."""
+async def wl_guard(event: ChatMemberUpdated, bot: Bot):
+    """Ловит любые действия Iris над пользователями из БС и откатывает."""
     if event.chat.type not in ("group", "supergroup"):
         return
-    new = event.new_chat_member
-    if new.status != "kicked":
+
+    target_uid = event.new_chat_member.user.id
+
+    # Нас и ботов игнорируем
+    if target_uid == bot.id or event.new_chat_member.user.is_bot:
         return
-    if not await wl_is(new.user.id, event.chat.id):
+
+    # Только для БС
+    if not await wl_is(target_uid, event.chat.id):
         return
+
+    # Проверяем права бота
     try:
         me = await bot.get_chat_member(event.chat.id, bot.id)
-        if me.status != "administrator" or not getattr(me, "can_restrict_members", False):
+        if me.status != "administrator":
             return
-        await bot.unban_chat_member(event.chat.id, new.user.id, only_if_banned=True)
-        logging.info(f"Auto-unban whitelist user {new.user.id} in chat {event.chat.id}")
-    except TelegramAPIError as e:
-        logging.error(f"auto-unban failed: {e}")
+    except TelegramAPIError:
+        return
+
+    new = event.new_chat_member
+    chat_title = event.chat.title or "чат"
+
+    # --- БАН (kicked) ---
+    if new.status == "kicked":
+        if not getattr(me, "can_restrict_members", False):
+            return
+        await asyncio.sleep(2)  # даём Iris закончить
+        try:
+            await bot.unban_chat_member(event.chat.id, target_uid, only_if_banned=True)
+            logging.info(f"WL: разбанен {target_uid} в {event.chat.id}")
+        except TelegramAPIError as e:
+            logging.error(f"WL unban failed: {e}")
+            return
+
+        # Пишем в ЛС со ссылкой
+        await send_wl_dm(target_uid, chat_title, event.chat.id, "бан от Iris")
+
+        # Уведомление в чат
+        try:
+            name = await get_display_name(target_uid)
+            await bot.send_message(
+                event.chat.id,
+                f"🛡 {user_mention(target_uid, name)} в белом списке — "
+                f"разбанен автоматически.\n"
+                f"<i>увы, но права Iris тут ничего не решают</i>"
+            )
+        except TelegramAPIError:
+            pass
+
+    # --- МУТ (restricted с can_send_messages=False) ---
+    elif new.status == "restricted":
+        if not getattr(me, "can_restrict_members", False):
+            return
+        # Проверяем, что реально ограничен
+        if getattr(new, "can_send_messages", True):
+            return
+        await asyncio.sleep(2)
+        try:
+            await bot.restrict_chat_member(
+                event.chat.id, target_uid,
+                permissions=full_unmute_perms())
+            logging.info(f"WL: размучен {target_uid} в {event.chat.id}")
+        except TelegramAPIError as e:
+            logging.error(f"WL unmute failed: {e}")
+            return
+
+        try:
+            name = await get_display_name(target_uid)
+            await bot.send_message(
+                event.chat.id,
+                f"🛡 {user_mention(target_uid, name)} в белом списке — "
+                f"мут снят автоматически.\n"
+                f"<i>увы, но права Iris тут ничего не решают</i>"
+            )
+        except TelegramAPIError:
+            pass
 
 # ================= ЗАПУСК =================
 async def on_startup(bot: Bot):
