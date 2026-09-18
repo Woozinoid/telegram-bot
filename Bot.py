@@ -19,7 +19,7 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 from aiogram.exceptions import TelegramAPIError
 
 # ================= КОНФИГ =================
-BOT_TOKEN = "8641527466:AAGSkaTzMJm5X6ExY3vVYRiMLxkwSxOOpnU"
+BOT_TOKEN = "8823945629:AAHfN3LN7lFahjV7kSC5I8f8SXfM4mvCbKQ"
 WEBHOOK_URL = "https://telegram-bot-qxtd.onrender.com/webhook"
 PORT = int(os.getenv("PORT", 8080))
 WEBHOOK_PATH = "/webhook"
