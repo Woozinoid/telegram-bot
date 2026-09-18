@@ -10,12 +10,16 @@ from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import (
+    Message, ReplyKeyboardMarkup, KeyboardButton,
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    CallbackQuery
+)
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiogram.exceptions import TelegramAPIError
 
 # ================= КОНФИГ =================
-BOT_TOKEN = "8823945629:AAHfN3LN7lFahjV7kSC5I8f8SXfM4mvCbKQ"
+BOT_TOKEN = "8641527466:AAGSkaTzMJm5X6ExY3vVYRiMLxkwSxOOpnU"
 WEBHOOK_URL = "https://telegram-bot-qxtd.onrender.com/webhook"
 PORT = int(os.getenv("PORT", 8080))
 WEBHOOK_PATH = "/webhook"
@@ -25,12 +29,42 @@ SUGGEST_GROUP_ID = -5369865912
 
 ADMIN_USERNAMES = ["Woozinoid", "durovgar"]
 
-PUBLISH_INTERVAL = 10
+POST_COOLDOWN = 10 * 60  # 10 минут
 
 # ================= ХРАНИЛИЩА =================
-post_queue = asyncio.Queue()
 banned_users = {}
 daily_stats = {"date": None, "sent": 0, "rejected": 0}
+user_last_post = {}
+pending_posts = {}
+processed_messages = {}
+DEDUP_WINDOW = 60
+
+
+def cleanup_dedup():
+    now = time.time()
+    to_del = [k for k, v in processed_messages.items() if now - v > DEDUP_WINDOW]
+    for k in to_del:
+        del processed_messages[k]
+
+
+def is_duplicate(message_id):
+    cleanup_dedup()
+    if message_id in processed_messages:
+        return True
+    processed_messages[message_id] = time.time()
+    return False
+
+
+def format_cooldown_left(seconds):
+    m = seconds // 60
+    s = seconds % 60
+    parts = []
+    if m:
+        parts.append(f"{m} мин.")
+    if s or not parts:
+        parts.append(f"{s} сек.")
+    return " ".join(parts)
+
 
 # ================= МАТ-ФИЛЬТР =================
 BAD_WORDS_PATTERN = re.compile(
@@ -88,14 +122,24 @@ def is_banned(uid):
     return uid in banned_users
 
 
-# ================= КЛАВИАТУРА =================
+# ================= КЛАВИАТУРЫ =================
 def main_kb():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📊 Мой пост")],
             [KeyboardButton(text="📨 Предложить новость")]
         ],
         resize_keyboard=True
+    )
+
+
+def moderation_kb(post_id):
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Опубликовать", callback_data=f"pub:{post_id}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"rej:{post_id}")
+            ]
+        ]
     )
 
 
@@ -103,8 +147,7 @@ def main_kb():
 router = Router()
 
 
-# ================= /start =================
-@router.message(CommandStart())
+@router.message(F.chat.type == "private", CommandStart())
 async def cmd_start(message: Message):
     if is_banned(message.from_user.id):
         ban = banned_users[message.from_user.id]
@@ -119,56 +162,21 @@ async def cmd_start(message: Message):
     await message.answer(
         "📨 <b>Добро пожаловать в предложку!</b>\n\n"
         "Отправь мне текст, фото или видео — я проверю грамматику "
-        "и поставлю в очередь на публикацию в канале.\n\n"
+        "и отправлю на модерацию.\n\n"
         "⚠️ Мат запрещён.\n"
-        "🕒 Посты выходят регулярно.",
+        "⏳ Один пост раз в 10 минут.",
         parse_mode="HTML",
         reply_markup=main_kb()
     )
 
 
-# ================= МОЙ ПОСТ =================
-@router.message(F.text == "📊 Мой пост")
-async def my_post(message: Message):
-    uid = message.from_user.id
-    position = None
-    for idx, item in enumerate(list(post_queue._queue)):
-        if item.get("user_id") == uid:
-            position = idx + 1
-            break
-
-    if position is None:
-        return await message.answer("❌ У вас нет постов в очереди.")
-
-    wait_sec = position * PUBLISH_INTERVAL
-    hours = wait_sec // 3600
-    minutes = (wait_sec % 3600) // 60
-    seconds = wait_sec % 60
-
-    parts = []
-    if hours:
-        parts.append(f"{hours} ч.")
-    if minutes:
-        parts.append(f"{minutes} мин.")
-    if seconds or not parts:
-        parts.append(f"{seconds} сек.")
-    time_str = " ".join(parts)
-
-    await message.answer(
-        f"📊 Ваш пост на позиции <b>{position}</b>\n"
-        f"⏳ Примерно через: <b>{time_str}</b>",
-        parse_mode="HTML"
-    )
-
-
-# ================= ПОДСКАЗКА =================
-@router.message(F.text == "📨 Предложить новость")
+@router.message(F.chat.type == "private", F.text == "📨 Предложить новость")
 async def suggest_hint(message: Message):
     await message.answer("✏️ Просто отправь мне текст (или фото/видео с подписью).")
 
 
 # ================= АДМИН-КОМАНДЫ =================
-@router.message(Command("ban"))
+@router.message(F.chat.type == "private", Command("ban"))
 async def cmd_ban(message: Message):
     if not is_admin(message.from_user):
         return
@@ -197,7 +205,7 @@ async def cmd_ban(message: Message):
     await message.reply(f"✅ {uid} забанен.")
 
 
-@router.message(Command("unban"))
+@router.message(F.chat.type == "private", Command("unban"))
 async def cmd_unban(message: Message):
     if not is_admin(message.from_user):
         return
@@ -212,7 +220,7 @@ async def cmd_unban(message: Message):
         await message.reply("❌ Не в бане.")
 
 
-@router.message(Command("banlist"))
+@router.message(F.chat.type == "private", Command("banlist"))
 async def cmd_banlist(message: Message):
     if not is_admin(message.from_user):
         return
@@ -224,7 +232,7 @@ async def cmd_banlist(message: Message):
     await message.reply(text, parse_mode="HTML")
 
 
-@router.message(Command("stats"))
+@router.message(F.chat.type == "private", Command("stats"))
 async def cmd_stats(message: Message):
     if not is_admin(message.from_user):
         return
@@ -237,13 +245,112 @@ async def cmd_stats(message: Message):
         f"📊 <b>Статистика за сегодня</b>\n"
         f"✅ Опубликовано: {daily_stats['sent']}\n"
         f"❌ Отклонено: {daily_stats['rejected']}\n"
-        f"⏳ В очереди: {post_queue.qsize()}",
+        f"⏳ На модерации: {len(pending_posts)}",
         parse_mode="HTML"
     )
 
 
+# ================= МОДЕРАЦИЯ =================
+@router.callback_query(F.data.startswith("pub:"))
+async def on_publish(call: CallbackQuery):
+    post_id = call.data.split(":")[1]
+    if not is_admin(call.from_user):
+        return await call.answer("⛔ Нет доступа", show_alert=True)
+
+    data = pending_posts.pop(post_id, None)
+    if not data:
+        return await call.answer("⚠️ Пост уже обработан", show_alert=True)
+
+    try:
+        if data["photo"]:
+            await call.bot.send_photo(
+                CHANNEL_ID, photo=data["photo"], caption=data["text"] or None
+            )
+        elif data["video"]:
+            await call.bot.send_video(
+                CHANNEL_ID, video=data["video"], caption=data["text"] or None
+            )
+        else:
+            await call.bot.send_message(
+                CHANNEL_ID, text=data["text"], disable_web_page_preview=True
+            )
+
+        today = time.strftime("%d.%m.%Y")
+        if daily_stats["date"] != today:
+            daily_stats["date"] = today
+            daily_stats["sent"] = 0
+            daily_stats["rejected"] = 0
+        daily_stats["sent"] += 1
+
+        try:
+            await call.bot.send_message(
+                data["user_id"], "✅ Ваш пост опубликован в канале!"
+            )
+        except TelegramAPIError:
+            pass
+
+        try:
+            new_caption = (call.message.caption or "") + f"\n\n✅ Одобрено: {call.from_user.full_name}"
+            await call.message.edit_caption(caption=new_caption, reply_markup=None)
+        except TelegramAPIError:
+            try:
+                await call.message.edit_text(
+                    (call.message.text or "") + f"\n\n✅ Одобрено: {call.from_user.full_name}",
+                    reply_markup=None
+                )
+            except TelegramAPIError:
+                pass
+
+        await call.answer("✅ Опубликовано")
+    except TelegramAPIError as e:
+        logging.error(f"Publish error: {e}")
+        await call.answer("❌ Ошибка публикации", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("rej:"))
+async def on_reject(call: CallbackQuery):
+    post_id = call.data.split(":")[1]
+    if not is_admin(call.from_user):
+        return await call.answer("⛔ Нет доступа", show_alert=True)
+
+    data = pending_posts.pop(post_id, None)
+    if not data:
+        return await call.answer("⚠️ Пост уже обработан", show_alert=True)
+
+    today = time.strftime("%d.%m.%Y")
+    if daily_stats["date"] != today:
+        daily_stats["date"] = today
+        daily_stats["sent"] = 0
+        daily_stats["rejected"] = 0
+    daily_stats["rejected"] += 1
+
+    try:
+        await call.bot.send_message(
+            data["user_id"], "❌ Ваш пост отклонён модератором."
+        )
+    except TelegramAPIError:
+        pass
+
+    try:
+        new_caption = (call.message.caption or "") + f"\n\n❌ Отклонено: {call.from_user.full_name}"
+        await call.message.edit_caption(caption=new_caption, reply_markup=None)
+    except TelegramAPIError:
+        try:
+            await call.message.edit_text(
+                (call.message.text or "") + f"\n\n❌ Отклонено: {call.from_user.full_name}",
+                reply_markup=None
+            )
+        except TelegramAPIError:
+            pass
+
+    await call.answer("❌ Отклонено")
+
+
 # ================= ПРИЁМ ПОСТОВ =================
 async def process_post(message: Message, text, photo=None, video=None):
+    if is_duplicate(message.message_id):
+        return
+
     uid = message.from_user.id
 
     if is_banned(uid):
@@ -255,6 +362,15 @@ async def process_post(message: Message, text, photo=None, video=None):
 
     if not text and not photo and not video:
         return
+
+    now = time.time()
+    last = user_last_post.get(uid, 0)
+    if now - last < POST_COOLDOWN:
+        left = int(POST_COOLDOWN - (now - last))
+        return await message.answer(
+            f"⏳ Подождите ещё <b>{format_cooldown_left(left)}</b> перед следующим постом.",
+            parse_mode="HTML"
+        )
 
     if text and has_bad_words(text):
         today = time.strftime("%d.%m.%Y")
@@ -276,126 +392,79 @@ async def process_post(message: Message, text, photo=None, video=None):
     else:
         author = message.from_user.full_name
 
-    header = "📨 <b>Новая предложка</b>\n"
+    post_id = f"{uid}_{int(now)}"
+
+    header = "📨 <b>Новая предложка на модерации</b>\n"
     header += f"👤 {escape(author)} (<code>{uid}</code>)\n\n"
     body = header + escape(fixed or "(без текста)")
 
     try:
         if photo:
-            await message.bot.send_photo(
+            sent = await message.bot.send_photo(
                 SUGGEST_GROUP_ID,
                 photo=photo.file_id,
                 caption=body,
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_markup=moderation_kb(post_id)
             )
         elif video:
-            await message.bot.send_video(
+            sent = await message.bot.send_video(
                 SUGGEST_GROUP_ID,
                 video=video.file_id,
                 caption=body,
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_markup=moderation_kb(post_id)
             )
         else:
-            await message.bot.send_message(
+            sent = await message.bot.send_message(
                 SUGGEST_GROUP_ID,
                 body,
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_markup=moderation_kb(post_id)
             )
+
+        pending_posts[post_id] = {
+            "user_id": uid,
+            "text": fixed,
+            "photo": photo.file_id if photo else None,
+            "video": video.file_id if video else None,
+            "admin_msg_id": sent.message_id,
+        }
     except TelegramAPIError as e:
         logging.error(f"Send to group error: {e}")
+        return await status.edit_text("❌ Не удалось отправить на модерацию.")
 
-    await post_queue.put({
-        "user_id": uid,
-        "text": fixed,
-        "photo": photo.file_id if photo else None,
-        "video": video.file_id if video else None,
-    })
-
-    pos = post_queue.qsize()
-    wait_sec = pos * PUBLISH_INTERVAL
-    hours = wait_sec // 3600
-    minutes = (wait_sec % 3600) // 60
-    seconds = wait_sec % 60
-
-    parts = []
-    if hours:
-        parts.append(f"{hours} ч.")
-    if minutes:
-        parts.append(f"{minutes} мин.")
-    if seconds or not parts:
-        parts.append(f"{seconds} сек.")
-    time_str = " ".join(parts)
+    user_last_post[uid] = now
 
     try:
         await status.edit_text(
-            f"✅ <b>Пост принят!</b>\n"
-            f"📌 Позиция в очереди: <b>{pos}</b>\n"
-            f"⏳ Примерно через: <b>{time_str}</b>",
+            "✅ <b>Пост отправлен на модерацию.</b>\n"
+            "Следующий пост можно будет отправить через 10 минут.",
             parse_mode="HTML"
         )
     except TelegramAPIError:
-        await message.answer(f"✅ Пост принят! Позиция: {pos}")
+        await message.answer(
+            "✅ Пост отправлен на модерацию. Следующий — через 10 минут."
+        )
 
 
 # ================= ОБРАБОТЧИКИ ТИПОВ =================
-@router.message(F.photo)
+@router.message(F.chat.type == "private", F.photo)
 async def handle_photo(message: Message):
-    await process_post(
-        message,
-        text=message.caption or "",
-        photo=message.photo[-1]
-    )
+    await process_post(message, text=message.caption or "", photo=message.photo[-1])
 
 
-@router.message(F.video)
+@router.message(F.chat.type == "private", F.video)
 async def handle_video(message: Message):
-    await process_post(
-        message,
-        text=message.caption or "",
-        video=message.video
-    )
+    await process_post(message, text=message.caption or "", video=message.video)
 
 
-@router.message(F.text & ~F.text.startswith("/") & ~F.text.in_({"📊 Мой пост", "📨 Предложить новость"}))
+@router.message(
+    F.chat.type == "private",
+    F.text & ~F.text.startswith("/") & ~F.text.in_({"📨 Предложить новость"})
+)
 async def handle_text(message: Message):
     await process_post(message, text=message.text)
-
-
-# ================= ОЧЕРЕДЬ ПУБЛИКАЦИИ =================
-async def publisher(bot: Bot):
-    while True:
-        await asyncio.sleep(PUBLISH_INTERVAL)
-        if post_queue.empty():
-            continue
-        item = await post_queue.get()
-        try:
-            if item["photo"]:
-                await bot.send_photo(
-                    CHANNEL_ID,
-                    photo=item["photo"],
-                    caption=item["text"] or None
-                )
-            elif item["video"]:
-                await bot.send_video(
-                    CHANNEL_ID,
-                    video=item["video"],
-                    caption=item["text"] or None
-                )
-            else:
-                await bot.send_message(
-                    CHANNEL_ID,
-                    text=item["text"],
-                    disable_web_page_preview=True
-                )
-            today = time.strftime("%d.%m.%Y")
-            if daily_stats["date"] != today:
-                daily_stats["date"] = today
-                daily_stats["sent"] = 0
-                daily_stats["rejected"] = 0
-            daily_stats["sent"] += 1
-            logging.info(f"Опубликован пост от {item['user_id']}")
-        except TelegramAPIError as e:
-            logging.error(f"Publish error: {e}")
 
 
 # ================= ЗАПУСК =================
@@ -427,8 +496,6 @@ async def main():
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
-    asyncio.create_task(publisher(bot))
-
     app = web.Application()
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
@@ -444,5 +511,5 @@ async def main():
 if __name__ == "__main__":
     try:
         asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
+    except SystemExit:
         logging.info("Остановлен.")
