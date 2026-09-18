@@ -1,6 +1,5 @@
 import os
 import re
-import sys
 import logging
 import asyncio
 import time
@@ -11,10 +10,7 @@ from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
-from aiogram.types import (
-    Message, ReplyKeyboardMarkup, KeyboardButton,
-    InlineKeyboardMarkup, InlineKeyboardButton
-)
+from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiogram.exceptions import TelegramAPIError
 
@@ -29,11 +25,11 @@ SUGGEST_GROUP_ID = -5369865912
 
 ADMIN_USERNAMES = ["Woozinoid", "durovgar"]
 
-PUBLISH_INTERVAL = 10  # 10 секунд
+PUBLISH_INTERVAL = 10
 
-# ================= ХРАНИЛИЩА (в памяти) =================
+# ================= ХРАНИЛИЩА =================
 post_queue = asyncio.Queue()
-banned_users = {}      # {user_id: {"reason": str, "date": str, "by": str}}
+banned_users = {}
 daily_stats = {"date": None, "sent": 0, "rejected": 0}
 
 # ================= МАТ-ФИЛЬТР =================
@@ -46,16 +42,19 @@ BAD_WORDS_PATTERN = re.compile(
     r"залуп(а|ы|е|ой|ушка)|"
     r"жоп(а|ы|е|ой|ушка|олиз)|"
     r"гандон|мудак|пидор|пидр|пидрила|лох|лошара|"
-    r"у(е|ё)бок|у(е|ё)бище|мразь|тварь|сволочь|гнида|падла|шлюха|проститутка|"
-    r"гомик|лезбиянка|трахать|трах|отсос|минет|ахуеть|ахуенно|охуеть|нихуя|нихера|похер|пофиг)\b",
+    r"у(е|ё)бок|у(е|ё)бище|мразь|тварь|сволочь|гнида|падла|"
+    r"шлюха|проститутка|гомик|лезбиянка|трахать|трах|отсос|"
+    r"минет|ахуеть|ахуенно|охуеть|нихуя|нихера|похер|пофиг)\b",
     re.IGNORECASE
 )
 
-def has_bad_words(text: str) -> bool:
+
+def has_bad_words(text):
     return bool(BAD_WORDS_PATTERN.search(text))
 
+
 # ================= ГРАММАТИКА =================
-async def fix_grammar(text: str) -> str:
+async def fix_grammar(text):
     import aiohttp
     url = "https://speller.yandex.net/services/spellservice.json/checkText"
     params = {"text": text, "lang": "ru", "options": 0}
@@ -77,14 +76,17 @@ async def fix_grammar(text: str) -> str:
         logging.error(f"Speller error: {e}")
         return text
 
+
 # ================= ПРАВА =================
-def is_admin(user) -> bool:
+def is_admin(user):
     if not user or not user.username:
         return False
     return user.username.lower() in [u.lower() for u in ADMIN_USERNAMES]
 
-def is_banned(uid: int) -> bool:
+
+def is_banned(uid):
     return uid in banned_users
+
 
 # ================= КЛАВИАТУРА =================
 def main_kb():
@@ -96,8 +98,10 @@ def main_kb():
         resize_keyboard=True
     )
 
+
 # ================= РОУТЕР =================
 router = Router()
+
 
 # ================= /start =================
 @router.message(CommandStart())
@@ -121,6 +125,7 @@ async def cmd_start(message: Message):
         parse_mode="HTML",
         reply_markup=main_kb()
     )
+
 
 # ================= МОЙ ПОСТ =================
 @router.message(F.text == "📊 Мой пост")
@@ -155,13 +160,15 @@ async def my_post(message: Message):
         parse_mode="HTML"
     )
 
+
 # ================= ПОДСКАЗКА =================
 @router.message(F.text == "📨 Предложить новость")
 async def suggest_hint(message: Message):
-    await message.answer("✏️ Просто отправь мне текст ( photoили фото/видео с подписью).=")
+    await message.answer("✏️ Просто отправь мне текст (или фото/видео с подписью).")
 
-# ================= АДМИН-КОmessageМАНДЫ =================
-@router..message(Command("ban"))
+
+# ================= АДМИН-КОМАНДЫ =================
+@router.message(Command("ban"))
 async def cmd_ban(message: Message):
     if not is_admin(message.from_user):
         return
@@ -173,9 +180,9 @@ async def cmd_ban(message: Message):
         return await message.reply("Укажи числовой ID.")
     uid = int(parts[0])
     reason = parts[1] if len(parts) > 1 else "Без причины"
-    banned_users[uid] =photo {
+    banned_users[uid] = {
         "reason": reason,
-        "date":[- time.strftime("%d.%m.%Y %H:%M"),
+        "date": time.strftime("%d.%m.%Y %H:%M"),
         "by": message.from_user.username or message.from_user.full_name
     }
     try:
@@ -188,6 +195,7 @@ async def cmd_ban(message: Message):
     except TelegramAPIError:
         pass
     await message.reply(f"✅ {uid} забанен.")
+
 
 @router.message(Command("unban"))
 async def cmd_unban(message: Message):
@@ -203,6 +211,7 @@ async def cmd_unban(message: Message):
     else:
         await message.reply("❌ Не в бане.")
 
+
 @router.message(Command("banlist"))
 async def cmd_banlist(message: Message):
     if not is_admin(message.from_user):
@@ -213,6 +222,7 @@ async def cmd_banlist(message: Message):
     for uid, b in banned_users.items():
         text += f"<code>{uid}</code> — {escape(b['reason'])} ({b['date']})\n"
     await message.reply(text, parse_mode="HTML")
+
 
 @router.message(Command("stats"))
 async def cmd_stats(message: Message):
@@ -231,8 +241,9 @@ async def cmd_stats(message: Message):
         parse_mode="HTML"
     )
 
+
 # ================= ПРИЁМ ПОСТОВ =================
-async def process_post(message: Message, text: str, photo=None, video=None):
+async def process_post(message: Message, text, photo=None, video=None):
     uid = message.from_user.id
 
     if is_banned(uid):
@@ -260,28 +271,34 @@ async def process_post(message: Message, text: str, photo=None, video=None):
     status = await message.answer("🔍 Проверяю грамматику...")
     fixed = await fix_grammar(text) if text else ""
 
-    author = f"@{message.from_user.username}" if message.from_user.username else message.from_user.full_name
+    if message.from_user.username:
+        author = "@" + message.from_user.username
+    else:
+        author = message.from_user.full_name
+
+    header = "📨 <b>Новая предложка</b>\n"
+    header += f"👤 {escape(author)} (<code>{uid}</code>)\n\n"
+    body = header + escape(fixed or "(без текста)")
 
     try:
-        header = f"📨 <b>Новая предложка</b>\n👤 {escape(author)} (<code>{uid}</code>)\n\n"
         if photo:
             await message.bot.send_photo(
                 SUGGEST_GROUP_ID,
                 photo=photo.file_id,
-                caption=header + escape(fixed or "(без текста)"),
+                caption=body,
                 parse_mode="HTML"
             )
         elif video:
             await message.bot.send_video(
                 SUGGEST_GROUP_ID,
                 video=video.file_id,
-                caption=header + escape(fixed or "(без текста)"),
+                caption=body,
                 parse_mode="HTML"
             )
         else:
             await message.bot.send_message(
                 SUGGEST_GROUP_ID,
-                header + escape(fixed),
+                body,
                 parse_mode="HTML"
             )
     except TelegramAPIError as e:
@@ -317,23 +334,18 @@ async def process_post(message: Message, text: str, photo=None, video=None):
             parse_mode="HTML"
         )
     except TelegramAPIError:
-        await message.answer(
-            f"✅ Пост принят! Позиция: {pos}",
-            parse_mode="HTML"
-        )
+        await message.answer(f"✅ Пост принят! Позиция: {pos}")
 
-# ================= ОБРАБОТЧИКИ =================
-@router.message(F.text & ~F.text.startswith("/") & ~F.text.in_({"📊 Мой пост", "📨 Предложить новость"}))
-async def handle_text(message: Message):
-    await process_post(message, text=message.text)
 
+# ================= ОБРАБОТЧИКИ ТИПОВ =================
 @router.message(F.photo)
 async def handle_photo(message: Message):
     await process_post(
         message,
         text=message.caption or "",
-       1]
+        photo=message.photo[-1]
     )
+
 
 @router.message(F.video)
 async def handle_video(message: Message):
@@ -342,6 +354,12 @@ async def handle_video(message: Message):
         text=message.caption or "",
         video=message.video
     )
+
+
+@router.message(F.text & ~F.text.startswith("/") & ~F.text.in_({"📊 Мой пост", "📨 Предложить новость"}))
+async def handle_text(message: Message):
+    await process_post(message, text=message.text)
+
 
 # ================= ОЧЕРЕДЬ ПУБЛИКАЦИИ =================
 async def publisher(bot: Bot):
@@ -355,15 +373,13 @@ async def publisher(bot: Bot):
                 await bot.send_photo(
                     CHANNEL_ID,
                     photo=item["photo"],
-                    caption=item["text"] or None,
-                    disable_notification=False
+                    caption=item["text"] or None
                 )
             elif item["video"]:
                 await bot.send_video(
                     CHANNEL_ID,
                     video=item["video"],
-                    caption=item["text"] or None,
-                    disable_notification=False
+                    caption=item["text"] or None
                 )
             else:
                 await bot.send_message(
@@ -381,6 +397,7 @@ async def publisher(bot: Bot):
         except TelegramAPIError as e:
             logging.error(f"Publish error: {e}")
 
+
 # ================= ЗАПУСК =================
 async def on_startup(bot: Bot):
     await bot.set_webhook(
@@ -390,8 +407,10 @@ async def on_startup(bot: Bot):
     )
     logging.info(f"Вебхук: {WEBHOOK_URL}")
 
+
 async def on_shutdown(bot: Bot):
     await bot.delete_webhook(drop_pending_updates=True)
+
 
 async def main():
     logging.basicConfig(
@@ -420,6 +439,7 @@ async def main():
     logging.info(f"Сервер запущен на порту {PORT}")
 
     await asyncio.Event().wait()
+
 
 if __name__ == "__main__":
     try:
