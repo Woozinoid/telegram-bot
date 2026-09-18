@@ -19,7 +19,7 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 from aiogram.exceptions import TelegramAPIError
 
 # ================= КОНФИГ =================
-BOT_TOKEN = "8823945629:AAHfN3LN7lFahjV7kSC5I8f8SXfM4mvCbKQ"
+BOT_TOKEN = "8641527466:AAGSkaTzMJm5X6ExY3vVYRiMLxkwSxOOpnU"
 WEBHOOK_URL = "https://telegram-bot-qxtd.onrender.com/webhook"
 PORT = int(os.getenv("PORT", 8080))
 WEBHOOK_PATH = "/webhook"
@@ -29,7 +29,7 @@ SUGGEST_GROUP_ID = -5369865912
 
 ADMIN_USERNAMES = ["Woozinoid", "durovgar"]
 
-POST_COOLDOWN = 2 * 60  # 10 минут
+POST_COOLDOWN = 2 * 60  # 2 минуты
 
 # ================= ХРАНИЛИЩА =================
 banned_users = {}
@@ -164,7 +164,7 @@ async def cmd_start(message: Message):
         "Отправь мне текст, фото или видео — я проверю грамматику "
         "и отправлю на модерацию.\n\n"
         "⚠️ Мат запрещён.\n"
-        "⏳ Один пост раз в 10 минут.",
+        "⏳ Один пост раз в 2 минуты.",
         parse_mode="HTML",
         reply_markup=main_kb()
     )
@@ -439,12 +439,12 @@ async def process_post(message: Message, text, photo=None, video=None):
     try:
         await status.edit_text(
             "✅ <b>Пост отправлен на модерацию.</b>\n"
-            "Следующий пост можно будет отправить через 10 минут.",
+            "Следующий пост можно будет отправить через 2 минуты.",
             parse_mode="HTML"
         )
     except TelegramAPIError:
         await message.answer(
-            "✅ Пост отправлен на модерацию. Следующий — через 10 минут."
+            "✅ Пост отправлен на модерацию. Следующий — через 2 минуты."
         )
 
 
