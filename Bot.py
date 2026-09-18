@@ -20,16 +20,16 @@ from aiogram.exceptions import TelegramAPIError
 
 # ================= КОНФИГ =================
 BOT_TOKEN = "8641527466:AAGSkaTzMJm5X6ExY3vVYRiMLxkwSxOOpnU"
-WEBHOOK_URL = "https://telegram-bot-qxtd.onrender.com/webhook"  # поменяй под свой сервис
+WEBHOOK_URL = "https://telegram-bot-qxtd.onrender.com/webhook"
 PORT = int(os.getenv("PORT", 8080))
 WEBHOOK_PATH = "/webhook"
 
 CHANNEL_ID = -1002396609986
 SUGGEST_GROUP_ID = -5369865912
 
-ADMIN_USERNAMES = ["Woozinoid", "durovgar"]  # кто может управлять
+ADMIN_USERNAMES = ["Woozinoid", "durovgar"]
 
-PUBLISH_INTERVAL = 1 * 60  # 2.5 часа
+PUBLISH_INTERVAL = 10  # 10 секунд
 
 # ================= ХРАНИЛИЩА (в памяти) =================
 post_queue = asyncio.Queue()
@@ -54,7 +54,7 @@ BAD_WORDS_PATTERN = re.compile(
 def has_bad_words(text: str) -> bool:
     return bool(BAD_WORDS_PATTERN.search(text))
 
-# ================= ГРАММАТИКА (Яндекс.Спеллер) =================
+# ================= ГРАММАТИКА =================
 async def fix_grammar(text: str) -> str:
     import aiohttp
     url = "https://speller.yandex.net/services/spellservice.json/checkText"
@@ -96,7 +96,7 @@ def main_kb():
         resize_keyboard=True
     )
 
-# ================= РОУТЕРЫ =================
+# ================= РОУТЕР =================
 router = Router()
 
 # ================= /start =================
@@ -126,7 +126,6 @@ async def cmd_start(message: Message):
 @router.message(F.text == "📊 Мой пост")
 async def my_post(message: Message):
     uid = message.from_user.id
-    # Ищем в очереди
     position = None
     for idx, item in enumerate(list(post_queue._queue)):
         if item.get("user_id") == uid:
@@ -139,7 +138,16 @@ async def my_post(message: Message):
     wait_sec = position * PUBLISH_INTERVAL
     hours = wait_sec // 3600
     minutes = (wait_sec % 3600) // 60
-    time_str = f"{hours} ч. {minutes} мин."
+    seconds = wait_sec % 60
+
+    parts = []
+    if hours:
+        parts.append(f"{hours} ч.")
+    if minutes:
+        parts.append(f"{minutes} мин.")
+    if seconds or not parts:
+        parts.append(f"{seconds} сек.")
+    time_str = " ".join(parts)
 
     await message.answer(
         f"📊 Ваш пост на позиции <b>{position}</b>\n"
@@ -150,10 +158,10 @@ async def my_post(message: Message):
 # ================= ПОДСКАЗКА =================
 @router.message(F.text == "📨 Предложить новость")
 async def suggest_hint(message: Message):
-    await message.answer("✏️ Просто отправь мне текст (или фото/видео с подписью).")
+    await message.answer("✏️ Просто отправь мне текст ( photoили фото/видео с подписью).=")
 
-# ================= АДМИН-КОМАНДЫ =================
-@router.message(Command("ban"))
+# ================= АДМИН-КОmessageМАНДЫ =================
+@router..message(Command("ban"))
 async def cmd_ban(message: Message):
     if not is_admin(message.from_user):
         return
@@ -165,9 +173,9 @@ async def cmd_ban(message: Message):
         return await message.reply("Укажи числовой ID.")
     uid = int(parts[0])
     reason = parts[1] if len(parts) > 1 else "Без причины"
-    banned_users[uid] = {
+    banned_users[uid] =photo {
         "reason": reason,
-        "date": time.strftime("%d.%m.%Y %H:%M"),
+        "date":[- time.strftime("%d.%m.%Y %H:%M"),
         "by": message.from_user.username or message.from_user.full_name
     }
     try:
@@ -237,7 +245,6 @@ async def process_post(message: Message, text: str, photo=None, video=None):
     if not text and not photo and not video:
         return
 
-    # Проверка мата
     if text and has_bad_words(text):
         today = time.strftime("%d.%m.%Y")
         if daily_stats["date"] != today:
@@ -250,13 +257,11 @@ async def process_post(message: Message, text: str, photo=None, video=None):
             "Исправь и отправь снова."
         )
 
-    # Проверка грамматики
     status = await message.answer("🔍 Проверяю грамматику...")
     fixed = await fix_grammar(text) if text else ""
 
     author = f"@{message.from_user.username}" if message.from_user.username else message.from_user.full_name
 
-    # Уведомление в группу предложки
     try:
         header = f"📨 <b>Новая предложка</b>\n👤 {escape(author)} (<code>{uid}</code>)\n\n"
         if photo:
@@ -282,7 +287,6 @@ async def process_post(message: Message, text: str, photo=None, video=None):
     except TelegramAPIError as e:
         logging.error(f"Send to group error: {e}")
 
-    # В очередь
     await post_queue.put({
         "user_id": uid,
         "text": fixed,
@@ -294,12 +298,22 @@ async def process_post(message: Message, text: str, photo=None, video=None):
     wait_sec = pos * PUBLISH_INTERVAL
     hours = wait_sec // 3600
     minutes = (wait_sec % 3600) // 60
+    seconds = wait_sec % 60
+
+    parts = []
+    if hours:
+        parts.append(f"{hours} ч.")
+    if minutes:
+        parts.append(f"{minutes} мин.")
+    if seconds or not parts:
+        parts.append(f"{seconds} сек.")
+    time_str = " ".join(parts)
 
     try:
         await status.edit_text(
             f"✅ <b>Пост принят!</b>\n"
             f"📌 Позиция в очереди: <b>{pos}</b>\n"
-            f"⏳ Примерно через: <b>{hours} ч. {minutes} мин.</b>",
+            f"⏳ Примерно через: <b>{time_str}</b>",
             parse_mode="HTML"
         )
     except TelegramAPIError:
@@ -308,8 +322,7 @@ async def process_post(message: Message, text: str, photo=None, video=None):
             parse_mode="HTML"
         )
 
-# ---- Обработчики разных типов ----
-
+# ================= ОБРАБОТЧИКИ =================
 @router.message(F.text & ~F.text.startswith("/") & ~F.text.in_({"📊 Мой пост", "📨 Предложить новость"}))
 async def handle_text(message: Message):
     await process_post(message, text=message.text)
@@ -319,7 +332,7 @@ async def handle_photo(message: Message):
     await process_post(
         message,
         text=message.caption or "",
-        photo=message.photo[-1]
+       1]
     )
 
 @router.message(F.video)
@@ -395,10 +408,8 @@ async def main():
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
 
-    # Запускаем публикацию в фоне
     asyncio.create_task(publisher(bot))
 
-    # Веб-сервер для Render
     app = web.Application()
     SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
