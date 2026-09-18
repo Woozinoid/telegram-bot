@@ -29,7 +29,7 @@ SUGGEST_GROUP_ID = -5369865912
 
 ADMIN_USERNAMES = ["Woozinoid", "durovgar"]
 
-POST_COOLDOWN = 10 * 60  # 10 минут
+POST_COOLDOWN = 2 * 60  # 10 минут
 
 # ================= ХРАНИЛИЩА =================
 banned_users = {}
